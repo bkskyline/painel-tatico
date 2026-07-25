@@ -271,9 +271,10 @@ function evalPositionWithWorker(worker, fen, depth = 10) {
 // Requires the global `Chess` constructor from the chess.js CDN script.
 function buildPlyList(rawPgn) {
   if (typeof Chess === "undefined") return null;
+  // chess.js 0.12.0 uses snake_case method names (load_pgn, not loadPgn as in later 1.x betas).
   const chess = new Chess();
-  const loaded = chess.loadPgn ? chess.loadPgn(rawPgn, { sloppy: true }) : false;
-  // chess.js v1 beta throws instead of returning false on bad PGN; guard with try/catch upstream.
+  const loaded = chess.load_pgn ? chess.load_pgn(rawPgn) : false;
+  if (loaded === false) return null;
   const history = chess.history({ verbose: true });
   if (!history || history.length === 0) return null;
 
