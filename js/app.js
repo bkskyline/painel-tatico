@@ -115,17 +115,92 @@ function saveSettings(settings) {
 }
 
 // ---------- Engine adapters ----------
-async function analyzeWithLichessCloud(pgn) {
+// Public CORS proxy — routes the browser's request through a third-party relay so the
+// Lichess API (which doesn't allow direct cross-origin calls) can be reached from a static
+// site with no backend of its own. This is a convenience for testing: it depends on a free
+// third-party service staying up, and isn't something to rely on long-term.
+const CORS_PROXY = "https://corsproxy.io/?url=";
+
+async function lichessFetch(url, options) {
+  return fetch(CORS_PROXY + encodeURIComponent(url), options);
+}
+
+// Extracts [%eval ...] annotations from a Lichess-analysed PGN's movetext and returns them
+// as a flat array of centipawn scores (from White's perspective), one per ply, in game order.
+// Mate scores are converted to a large finite number preserving sign.
+function extractLichessEvals(pgnWithEvals) {
+  const evalRegex = /\[%eval\s+(#?-?\d+(?:\.\d+)?)\]/g;
+  const evals = [];
+  let m;
+  while ((m = evalRegex.exec(pgnWithEvals)) !== null) {
+    const raw = m[1];
+    if (raw.startsWith("#")) {
+      const mateIn = parseInt(raw.slice(1), 10);
+      evals.push(mateIn > 0 ? 10000 : -10000);
+    } else {
+      evals.push(Math.round(parseFloat(raw) * 100)); // pawns -> centipawns
+    }
+  }
+  return evals;
+}
+
+// Imports a PGN to Lichess (via CORS proxy), polls its export endpoint until the analysis
+// (%eval comments) is present or a timeout is hit, then classifies the user's own moves
+// by centipawn loss — same bucket vocabulary as the local Stockfish path.
+async function analyzeWithLichessCloud(pgn, side, onProgress) {
   try {
-    const importRes = await fetch("https://lichess.org/api/import", {
+    const importRes = await lichessFetch("https://lichess.org/api/import", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: "pgn=" + encodeURIComponent(pgn),
     });
     if (!importRes.ok) return { ok: false, reason: "import_failed" };
     const data = await importRes.json();
-    return { ok: true, url: data.url, id: data.id };
-  } catch (e) { return { ok: false, reason: "network" }; }
+    const gameId = data.id;
+    if (!gameId) return { ok: false, reason: "no_id" };
+
+    // Lichess analyses asynchronously after import. Poll the analysed PGN export a few times.
+    const maxAttempts = 8;
+    let pgnWithEvals = null;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      onProgress && onProgress(attempt + 1, maxAttempts);
+      await new Promise((r) => setTimeout(r, 2500));
+      const exportRes = await lichessFetch(`https://lichess.org/game/export/${gameId}?evals=1&clocks=0`, {
+        headers: { Accept: "application/x-chess-pgn" },
+      });
+      if (!exportRes.ok) continue;
+      const text = await exportRes.text();
+      if (text.includes("%eval")) { pgnWithEvals = text; break; }
+    }
+
+    if (!pgnWithEvals) {
+      return { ok: false, reason: "analysis_not_ready", url: data.url };
+    }
+
+    const evals = extractLichessEvals(pgnWithEvals);
+    const plies = buildPlyList(pgn);
+    if (!plies || evals.length === 0) return { ok: false, reason: "parse_failed", url: data.url };
+
+    // evals[i] is the position AFTER ply i was played, from White's perspective.
+    const counts = { genius: 0, best: 0, good: 0, inaccuracy: 0, mistake: 0, blunder: 0 };
+    const moveResults = [];
+    for (let i = 0; i < plies.length && i < evals.length; i++) {
+      const ply = plies[i];
+      const userSideChar = side === "white" ? "white" : side === "black" ? "black" : null;
+      if (userSideChar && ply.side !== userSideChar) continue;
+      const before = i === 0 ? 0 : evals[i - 1];
+      const after = evals[i];
+      const sign = ply.side === "white" ? 1 : -1;
+      const cpLoss = (before * sign) - (after * sign);
+      const bucket = bucketFromCpLoss(cpLoss);
+      counts[bucket]++;
+      moveResults.push({ san: ply.san, cpLoss, bucket });
+    }
+
+    return { ok: true, counts, moveResults, url: data.url };
+  } catch (e) {
+    return { ok: false, reason: "network" };
+  }
 }
 
 // Stockfish worker singleton — created lazily on first use so pages that never touch
@@ -528,7 +603,7 @@ function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, set
         React.createElement("label", { style: labelStyle }, "Modo de análise"),
         React.createElement("select", { value: engineMode, onChange: (e) => setEngineMode(e.target.value), style: selectStyle },
           React.createElement("option", { value: "none" }, "Sem engine (usa anotações do PGN)"),
-          React.createElement("option", { value: "lichess-cloud" }, "API do Lichess (cloud) — experimental"),
+          React.createElement("option", { value: "lichess-cloud" }, "API do Lichess (via proxy)"),
           React.createElement("option", { value: "stockfish-js" }, "Stockfish.js no navegador")
         )
       )
@@ -547,7 +622,7 @@ function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, set
       style: { background: analyzing ? C.brassDim : C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "12px 24px", fontWeight: 700, fontSize: 14, cursor: analyzing ? "default" : "pointer", width: "100%" }
     }, analyzing ? "Analisando…" : "Adicionar e analisar"),
     React.createElement("p", { style: { fontSize: 12, color: C.inkFaint, marginTop: 12, lineHeight: 1.6 } },
-      "Nota sobre engines: o modo \"sem engine\" usa as anotações (!!, !, ?!, ?, ??) já presentes no PGN — rápido, mas só funciona se a fonte já anotou a partida (o Chessis faz isso; PGN cru do Chess.com/Lichess geralmente não). O modo Stockfish.js roda a análise de verdade, lance a lance, local no seu navegador — mais lento (alguns segundos por lance), mas funciona em qualquer PGN. O modo Lichess cloud ainda é experimental: navegadores bloqueiam por segurança (CORS) a chamada direta à API do Lichess sem um servidor intermediário."
+      "Nota sobre engines: o modo \"sem engine\" usa as anotações (!!, !, ?!, ?, ??) já presentes no PGN — rápido, mas só funciona se a fonte já anotou (Chessis faz isso; PGN cru do Chess.com/Lichess geralmente não). O modo Stockfish.js roda análise real, local no navegador — mais lento, mas funciona em qualquer PGN. O modo Lichess cloud importa a partida e busca a análise deles via um proxy público (corsproxy.io) para contornar bloqueio de navegador — pode levar até ~20s e depende desse serviço de terceiro estar no ar; se falhar, tenta de novo em instantes."
     )
   );
 }
@@ -717,10 +792,17 @@ function App() {
     let externalCounts = null;
 
     if (engineMode === "lichess-cloud") {
-      const r = await analyzeWithLichessCloud(pgnText);
-      engineNote = r.ok
-        ? `Importado ao Lichess para análise: ${r.url}`
-        : "Análise via Lichess indisponível agora (bloqueio de navegador) — usando anotações do PGN como fallback.";
+      setAnalyzeProgress({ current: 0, total: 8 });
+      const r = await analyzeWithLichessCloud(pgnText, resolvedSide, (cur, tot) => setAnalyzeProgress({ current: cur, total: tot }));
+      setAnalyzeProgress(null);
+      if (r.ok) {
+        externalCounts = r.counts;
+        engineNote = `Analisado pelo motor do Lichess (via proxy CORS). Partida importada: ${r.url}`;
+      } else if (r.reason === "analysis_not_ready") {
+        engineNote = `Lichess ainda não terminou de analisar essa partida — tente de novo em ~1 min, ou veja em: ${r.url}. Usando anotações do PGN como fallback por enquanto.`;
+      } else {
+        engineNote = "Análise via Lichess indisponível agora (proxy ou rede) — usando anotações do PGN como fallback.";
+      }
     } else if (engineMode === "stockfish-js") {
       setAnalyzeProgress({ current: 0, total: parsed.moves.length });
       const r = await analyzeWithStockfish(pgnText, resolvedSide, (cur, tot) => setAnalyzeProgress({ current: cur, total: tot }));
@@ -852,7 +934,9 @@ function App() {
     }),
     analyzeProgress && React.createElement("div", {
       style: { position: "fixed", bottom: 16, left: "50%", transform: "translateX(-50%)", background: C.bgPanel2, border: `1px solid ${C.brassDim}`, borderRadius: 8, padding: "10px 18px", fontSize: 13, color: C.brass, zIndex: 9998 }
-    }, `Analisando com Stockfish… lance ${analyzeProgress.current}/${analyzeProgress.total}`),
+    }, engineMode === "lichess-cloud"
+        ? `Aguardando análise do Lichess… tentativa ${analyzeProgress.current}/${analyzeProgress.total}`
+        : `Analisando com Stockfish… lance ${analyzeProgress.current}/${analyzeProgress.total}`),
     React.createElement("div", { style: { maxWidth: 880, margin: "0 auto", padding: "24px 20px" } },
       tab === "add" ? React.createElement(AddGameView, { pgnInput, setPgnInput, source, setSource, engineMode, setEngineMode, onAdd: handleAddGame, analyzing, status: addStatus })
       : tab === "settings" ? React.createElement(SettingsView, { settings, onSave: persistSettings })
