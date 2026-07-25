@@ -1,4 +1,4 @@
-const CACHE_NAME = "painel-tatico-v2";
+const CACHE_NAME = "painel-tatico-v3";
 const ASSETS = [
   "./",
   "./index.html",
@@ -26,12 +26,22 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const req = event.request;
-  // Network-first for CDN scripts (React, chess.js, Stockfish), cache-first for local assets
-  if (req.url.includes("unpkg.com") || req.url.includes("jsdelivr.net") || req.url.includes("cdnjs.cloudflare.com")) {
+
+  // The Cache API only supports GET requests. POST/PUT/etc (like the Lichess import call,
+  // or the CORS-proxy-relayed requests) must always go straight to the network, uncached —
+  // trying to cache.put() a non-GET response throws and can otherwise break the request.
+  if (req.method !== "GET") {
+    event.respondWith(fetch(req));
+    return;
+  }
+
+  // Network-first for CDN scripts (React, chess.js, Stockfish) and any proxied/cross-origin
+  // request, cache-first for local same-origin assets.
+  if (req.url.includes("unpkg.com") || req.url.includes("jsdelivr.net") || req.url.includes("cdnjs.cloudflare.com") || req.url.includes("corsproxy.io") || req.url.includes("lichess.org")) {
     event.respondWith(
       fetch(req).then((res) => {
         const resClone = res.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(req, resClone));
+        caches.open(CACHE_NAME).then((cache) => cache.put(req, resClone)).catch(() => {});
         return res;
       }).catch(() => caches.match(req))
     );
@@ -43,7 +53,7 @@ self.addEventListener("fetch", (event) => {
       if (cached) return cached;
       return fetch(req).then((res) => {
         const resClone = res.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(req, resClone));
+        caches.open(CACHE_NAME).then((cache) => cache.put(req, resClone)).catch(() => {});
         return res;
       }).catch(() => cached);
     })
