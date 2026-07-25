@@ -35,6 +35,22 @@ function classifyMoves(moves) {
   return counts;
 }
 
+// Determines which side (white/black/unknown) the user played, given saved usernames.
+// Returns "unknown" when neither White nor Black tag matches "Você" or a known username —
+// in that case the caller should prompt the person to pick a side manually.
+function detectUserSide(tags, knownUsernames = []) {
+  const white = (tags.White || "").trim().toLowerCase();
+  const black = (tags.Black || "").trim().toLowerCase();
+  const isVoce = (s) => /voc[eê]/i.test(s);
+  const normalizedKnown = knownUsernames.map((u) => u.trim().toLowerCase()).filter(Boolean);
+
+  if (isVoce(white) && !isVoce(black)) return "white";
+  if (isVoce(black) && !isVoce(white)) return "black";
+  if (normalizedKnown.includes(white) && !normalizedKnown.includes(black)) return "white";
+  if (normalizedKnown.includes(black) && !normalizedKnown.includes(white)) return "black";
+  return "unknown";
+}
+
 // Splits the flat move list (White, Black, White, Black, ...) into each side's moves.
 function splitMovesBySide(moves) {
   const white = [];
@@ -46,26 +62,24 @@ function splitMovesBySide(moves) {
   return { white, black };
 }
 
-// Returns only the moves belonging to "Você" (the user), based on the White/Black PGN tags.
-function userMoves(moves, tags) {
+// Returns only the moves belonging to the user, given an explicit resolved side
+// ("white" | "black"). Falls back to all moves if side is "unknown" — callers should
+// avoid that case by resolving the side (auto-detect or manual pick) before calling.
+function userMoves(moves, side) {
   const { white, black } = splitMovesBySide(moves);
-  const userIsWhite = /voc[eê]/i.test(tags.White || "");
-  const userIsBlack = /voc[eê]/i.test(tags.Black || "");
-  if (userIsBlack && !userIsWhite) return black;
-  if (userIsWhite && !userIsBlack) return white;
-  // Fallback: if we can't tell who's "Você" from tags, keep all moves rather than guessing wrong.
+  if (side === "white") return white;
+  if (side === "black") return black;
   return moves;
 }
 
-function detectResult(tags) {
+function detectResult(tags, resolvedSide) {
   const r = tags.Result || "*";
-  const userIsWhite = /voc[eê]/i.test(tags.White || "");
-  const userIsBlack = /voc[eê]/i.test(tags.Black || "");
+  const side = resolvedSide || detectUserSide(tags);
   let outcome = "desconhecido";
-  if (r === "1-0") outcome = userIsWhite ? "vitória" : userIsBlack ? "derrota" : "brancas venceram";
-  else if (r === "0-1") outcome = userIsBlack ? "vitória" : userIsWhite ? "derrota" : "pretas venceram";
+  if (r === "1-0") outcome = side === "white" ? "vitória" : side === "black" ? "derrota" : "brancas venceram";
+  else if (r === "0-1") outcome = side === "black" ? "vitória" : side === "white" ? "derrota" : "pretas venceram";
   else if (r === "1/2-1/2") outcome = "empate";
-  return { outcome, userColor: userIsWhite ? "white" : userIsBlack ? "black" : "unknown" };
+  return { outcome, userColor: side };
 }
 
 function openingFamily(ecoOrName) {
@@ -76,6 +90,8 @@ function openingFamily(ecoOrName) {
 
 // ---------- Storage (localStorage-backed) ----------
 const GAMES_KEY = "chesskpi:games";
+const SETTINGS_KEY = "chesskpi:settings";
+
 function loadGames() {
   try {
     const raw = localStorage.getItem(GAMES_KEY);
@@ -84,6 +100,17 @@ function loadGames() {
 }
 function saveGames(games) {
   try { localStorage.setItem(GAMES_KEY, JSON.stringify(games)); }
+  catch (e) { console.error("localStorage set failed", e); }
+}
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    return raw ? JSON.parse(raw) : { usernames: [] };
+  } catch { return { usernames: [] }; }
+}
+function saveSettings(settings) {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); }
   catch (e) { console.error("localStorage set failed", e); }
 }
 
@@ -101,19 +128,154 @@ async function analyzeWithLichessCloud(pgn) {
   } catch (e) { return { ok: false, reason: "network" }; }
 }
 
+// Stockfish worker singleton — created lazily on first use so pages that never touch
+// engine analysis don't pay the download/init cost.
+let _sfWorker = null;
+let _sfReady = null;
+
+function getStockfishWorker() {
+  if (_sfWorker) return _sfReady;
+  _sfReady = new Promise((resolve, reject) => {
+    try {
+      const worker = new Worker("https://cdn.jsdelivr.net/npm/stockfish@16.0.0/src/stockfish-nnue-16-single.js");
+      const onFirstMessage = (e) => {
+        if (String(e.data).includes("uciok") || String(e.data).includes("Stockfish")) {
+          worker.removeEventListener("message", onFirstMessage);
+          resolve(worker);
+        }
+      };
+      worker.addEventListener("message", onFirstMessage);
+      worker.addEventListener("error", (err) => reject(err));
+      worker.postMessage("uci");
+      _sfWorker = worker;
+      // Safety timeout: some CDN builds respond slowly or with different handshake text.
+      setTimeout(() => resolve(worker), 4000);
+    } catch (err) {
+      reject(err);
+    }
+  });
+  return _sfReady;
+}
+
+// Evaluates a single FEN position with Stockfish, returns centipawn score from White's
+// perspective (positive = White better), or null on mate-in-N scores converted to a large number.
+function evalPositionWithWorker(worker, fen, depth = 10) {
+  return new Promise((resolve) => {
+    let resolved = false;
+    const onMessage = (e) => {
+      const line = typeof e.data === "string" ? e.data : "";
+      const mateMatch = line.match(/score mate (-?\d+)/);
+      const cpMatch = line.match(/score cp (-?\d+)/);
+      if (line.startsWith("bestmove")) {
+        if (!resolved) {
+          resolved = true;
+          worker.removeEventListener("message", onMessage);
+          resolve(lastScore);
+        }
+        return;
+      }
+      if (mateMatch) lastScore = (parseInt(mateMatch[1], 10) > 0 ? 1 : -1) * 10000;
+      else if (cpMatch) lastScore = parseInt(cpMatch[1], 10);
+    };
+    let lastScore = 0;
+    worker.addEventListener("message", onMessage);
+    worker.postMessage("position fen " + fen);
+    worker.postMessage("go depth " + depth);
+    // Safety timeout per position so one stuck eval doesn't hang the whole game analysis.
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        worker.removeEventListener("message", onMessage);
+        resolve(lastScore);
+      }
+    }, 3000);
+  });
+}
+
+// Replays a PGN through chess.js move-by-move, producing { san, fenBefore, fenAfter, side } per ply.
+// Requires the global `Chess` constructor from the chess.js CDN script.
+function buildPlyList(rawPgn) {
+  if (typeof Chess === "undefined") return null;
+  const chess = new Chess();
+  const loaded = chess.loadPgn ? chess.loadPgn(rawPgn, { sloppy: true }) : false;
+  // chess.js v1 beta throws instead of returning false on bad PGN; guard with try/catch upstream.
+  const history = chess.history({ verbose: true });
+  if (!history || history.length === 0) return null;
+
+  const replay = new Chess();
+  const plies = [];
+  history.forEach((mv) => {
+    const fenBefore = replay.fen();
+    replay.move({ from: mv.from, to: mv.to, promotion: mv.promotion });
+    const fenAfter = replay.fen();
+    plies.push({ san: mv.san, fenBefore, fenAfter, side: mv.color === "w" ? "white" : "black" });
+  });
+  return plies;
+}
+
+// Classifies centipawn loss into the same bucket vocabulary used elsewhere in the app.
+function bucketFromCpLoss(cpLoss) {
+  if (cpLoss >= 300) return "blunder";
+  if (cpLoss >= 150) return "mistake";
+  if (cpLoss >= 60) return "inaccuracy";
+  if (cpLoss <= -120) return "genius"; // move gained significant advantage vs engine expectation
+  if (cpLoss <= 0) return "best";
+  return "good";
+}
+
+// Runs a full local Stockfish analysis over a PGN, returning per-user-move classification
+// counts plus a flat array of { san, cpLoss, bucket } for the user's own moves only.
+// Progress callback receives (currentPly, totalPlies) for UI feedback.
+async function analyzeWithStockfish(rawPgn, side, onProgress) {
+  const plies = buildPlyList(rawPgn);
+  if (!plies) return { ok: false, reason: "parse_failed" };
+
+  let worker;
+  try {
+    worker = await getStockfishWorker();
+  } catch (e) {
+    return { ok: false, reason: "worker_failed" };
+  }
+
+  const results = [];
+  const userSideChar = side === "white" ? "white" : side === "black" ? "black" : null;
+
+  for (let i = 0; i < plies.length; i++) {
+    const ply = plies[i];
+    if (userSideChar && ply.side !== userSideChar) {
+      onProgress && onProgress(i + 1, plies.length);
+      continue;
+    }
+    const evalBefore = await evalPositionWithWorker(worker, ply.fenBefore, 10);
+    const evalAfter = await evalPositionWithWorker(worker, ply.fenAfter, 10);
+    // Normalize both evals to "how good for the side who just moved"
+    const sign = ply.side === "white" ? 1 : -1;
+    const before = evalBefore * sign;
+    const after = -evalAfter * sign; // after the move, eval is reported from other side's turn
+    const cpLoss = before - after;
+    results.push({ san: ply.san, cpLoss, bucket: bucketFromCpLoss(cpLoss) });
+    onProgress && onProgress(i + 1, plies.length);
+  }
+
+  const counts = { genius: 0, best: 0, good: 0, inaccuracy: 0, mistake: 0, blunder: 0 };
+  results.forEach((r) => counts[r.bucket]++);
+
+  return { ok: true, counts, moveResults: results };
+}
+
 // ---------- KPI computation ----------
-function computeGameKPIs(game) {
+function computeGameKPIs(game, resolvedSide, externalCounts) {
   const { moves, tags } = game.parsed;
-  // Only classify the user's own moves — mixing both sides was inflating error counts
-  // with the opponent's mistakes/brilliancies.
-  const mine = userMoves(moves, tags);
-  const counts = classifyMoves(mine);
+  const mine = userMoves(moves, resolvedSide);
+  const counts = externalCounts || classifyMoves(mine);
   const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
   const errorWeight = counts.blunder * 3 + counts.mistake * 2 + counts.inaccuracy * 1;
   const errorRate = errorWeight / total;
-  // Phase split operates on the user's move subset (each entry here is one of the user's
-  // own plies, already every-other-ply from the raw PGN), so slice sizes are halved
-  // relative to full-game ply counts.
+
+  // Phase split: when we have externally-computed per-move buckets (Stockfish), we don't
+  // currently carry ply-order metadata through externalCounts, so phase breakdown still
+  // uses the annotation-based approximation on the user's move subset. This is a known
+  // simplification — good enough for "which third of the game is weakest" at a glance.
   const phases = { opening: mine.slice(0, 6), middlegame: mine.slice(6, 16), endgame: mine.slice(16) };
   const phaseErr = {};
   Object.entries(phases).forEach(([k, arr]) => {
@@ -132,7 +294,7 @@ function aggregateKPIs(games) {
   const phaseAgg = { opening: [], middlegame: [], endgame: [] };
   games.forEach((g) => {
     const fam = openingFamily(g.parsed.tags.Opening || g.parsed.tags.ECO);
-    const result = detectResult(g.parsed.tags);
+    const result = detectResult(g.parsed.tags, g.resolvedSide);
     if (!byOpening[fam]) byOpening[fam] = { games: 0, wins: 0, losses: 0, draws: 0, errorRateSum: 0 };
     byOpening[fam].games++;
     if (result.outcome === "vitória") { byOpening[fam].wins++; wins++; }
@@ -251,7 +413,7 @@ function SectionLabel({ children }) {
 }
 
 function GameRow({ game, onClick }) {
-  const result = detectResult(game.parsed.tags);
+  const result = detectResult(game.parsed.tags, game.resolvedSide);
   const tone = result.outcome === "vitória" ? "good" : result.outcome === "derrota" ? "bad" : "neutral";
   return React.createElement("button", {
     onClick, style: { display: "flex", justifyContent: "space-between", alignItems: "center", background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "12px 16px", cursor: "pointer", textAlign: "left", width: "100%", color: C.ink }
@@ -385,7 +547,7 @@ function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, set
       style: { background: analyzing ? C.brassDim : C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "12px 24px", fontWeight: 700, fontSize: 14, cursor: analyzing ? "default" : "pointer", width: "100%" }
     }, analyzing ? "Analisando…" : "Adicionar e analisar"),
     React.createElement("p", { style: { fontSize: 12, color: C.inkFaint, marginTop: 12, lineHeight: 1.6 } },
-      "Nota sobre engines: o modo \"sem engine\" usa as anotações (!!, !, ?!, ?, ??) já presentes no PGN exportado — é o modo recomendado e o que já funciona de ponta a ponta. O modo Lichess cloud e o Stockfish.js ainda são experimentais nesta versão: navegadores bloqueiam chamadas diretas ao Lichess por segurança (CORS), então esses modos caem automaticamente no fallback de anotações."
+      "Nota sobre engines: o modo \"sem engine\" usa as anotações (!!, !, ?!, ?, ??) já presentes no PGN — rápido, mas só funciona se a fonte já anotou a partida (o Chessis faz isso; PGN cru do Chess.com/Lichess geralmente não). O modo Stockfish.js roda a análise de verdade, lance a lance, local no seu navegador — mais lento (alguns segundos por lance), mas funciona em qualquer PGN. O modo Lichess cloud ainda é experimental: navegadores bloqueiam por segurança (CORS) a chamada direta à API do Lichess sem um servidor intermediário."
     )
   );
 }
@@ -396,7 +558,7 @@ function HistoryView({ games, onSelect, onDelete }) {
     React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 22, marginBottom: 20 } }, `Histórico completo (${games.length})`),
     React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
       [...games].reverse().map((g) => {
-        const result = detectResult(g.parsed.tags);
+        const result = detectResult(g.parsed.tags, g.resolvedSide);
         const tone = result.outcome === "vitória" ? "good" : result.outcome === "derrota" ? "bad" : "neutral";
         return React.createElement("div", { key: g.id, style: { display: "flex", justifyContent: "space-between", alignItems: "center", background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "12px 16px" } },
           React.createElement("button", { onClick: () => onSelect(g.id), style: { background: "none", border: "none", color: C.ink, textAlign: "left", cursor: "pointer", flex: 1 } },
@@ -414,7 +576,7 @@ function HistoryView({ games, onSelect, onDelete }) {
 }
 
 function GameDetailView({ game, onBack }) {
-  const result = detectResult(game.parsed.tags);
+  const result = detectResult(game.parsed.tags, game.resolvedSide);
   const { counts, errorRate, phaseErr, weakestPhase } = game.kpis;
   const phaseNames = { opening: "Abertura", middlegame: "Meio-jogo", endgame: "Final" };
   const rows = [
@@ -453,8 +615,88 @@ function GameDetailView({ game, onBack }) {
   );
 }
 
+function SideChoiceModal({ tags, onChoose, onCancel }) {
+  return React.createElement("div", {
+    style: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10000, padding: 20 }
+  },
+    React.createElement("div", { style: { background: C.bgPanel, border: `1px solid ${C.brassDim}`, borderRadius: 10, padding: 24, maxWidth: 420, width: "100%" } },
+      React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 18, marginBottom: 10 } }, "Qual lado você jogou?"),
+      React.createElement("p", { style: { color: C.inkDim, fontSize: 13.5, marginBottom: 18, lineHeight: 1.6 } },
+        `Não reconheci automaticamente pelo PGN. Brancas: "${tags.White || "?"}" · Pretas: "${tags.Black || "?"}". Escolha seu lado nesta partida — isso não muda seu usuário salvo.`
+      ),
+      React.createElement("div", { style: { display: "flex", gap: 10, marginBottom: 12 } },
+        React.createElement("button", {
+          onClick: () => onChoose("white"),
+          style: { flex: 1, background: C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "12px 14px", fontWeight: 700, cursor: "pointer" }
+        }, `Brancas (${tags.White || "?"})`),
+        React.createElement("button", {
+          onClick: () => onChoose("black"),
+          style: { flex: 1, background: C.felt, color: C.bg, border: "none", borderRadius: 6, padding: "12px 14px", fontWeight: 700, cursor: "pointer" }
+        }, `Pretas (${tags.Black || "?"})`)
+      ),
+      React.createElement("button", {
+        onClick: onCancel,
+        style: { width: "100%", background: "none", border: `1px solid ${C.line}`, color: C.inkDim, borderRadius: 6, padding: "9px 14px", fontSize: 13, cursor: "pointer" }
+      }, "Cancelar")
+    )
+  );
+}
+
+function SettingsView({ settings, onSave }) {
+  const [newUsername, setNewUsername] = useState("");
+  const usernames = settings.usernames || [];
+
+  const addUsername = () => {
+    const trimmed = newUsername.trim();
+    if (!trimmed) return;
+    if (usernames.some((u) => u.toLowerCase() === trimmed.toLowerCase())) { setNewUsername(""); return; }
+    onSave({ ...settings, usernames: [...usernames, trimmed] });
+    setNewUsername("");
+  };
+
+  const removeUsername = (u) => {
+    onSave({ ...settings, usernames: usernames.filter((x) => x !== u) });
+  };
+
+  const labelStyle = { fontSize: 12, letterSpacing: "0.05em", textTransform: "uppercase", color: C.inkFaint, marginBottom: 8, display: "block", fontWeight: 600 };
+
+  return React.createElement("div", { style: { maxWidth: 560, margin: "0 auto" } },
+    React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 22, marginBottom: 4 } }, "Configurações"),
+    React.createElement("p", { style: { color: C.inkDim, fontSize: 13.5, marginBottom: 24, lineHeight: 1.6 } },
+      "Salve seus usernames de Lichess, Chess.com etc. O app usa essa lista para identificar automaticamente qual lado (brancas/pretas) é você em PGNs que não dizem \"Você\" explicitamente. Quando o username não bate com nenhum salvo, o app pergunta na hora."
+    ),
+    React.createElement("label", { style: labelStyle }, "Adicionar username"),
+    React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 20 } },
+      React.createElement("input", {
+        value: newUsername, onChange: (e) => setNewUsername(e.target.value),
+        onKeyDown: (e) => { if (e.key === "Enter") addUsername(); },
+        placeholder: "ex: bkskyline123",
+        style: { flex: 1, background: C.bgPanel2, border: `1px solid ${C.line}`, borderRadius: 6, color: C.ink, padding: "10px 12px", fontSize: 14 }
+      }),
+      React.createElement("button", {
+        onClick: addUsername,
+        style: { background: C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "10px 18px", fontWeight: 700, cursor: "pointer" }
+      }, "Adicionar")
+    ),
+    React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
+      usernames.length === 0
+        ? React.createElement("p", { style: { color: C.inkFaint, fontSize: 13 } }, "Nenhum username salvo ainda.")
+        : usernames.map((u) => React.createElement("div", {
+            key: u, style: { display: "flex", justifyContent: "space-between", alignItems: "center", background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "10px 14px" }
+          },
+            React.createElement("span", { style: { fontSize: 13.5 } }, u),
+            React.createElement("button", {
+              onClick: () => removeUsername(u),
+              style: { background: "none", border: `1px solid ${C.line}`, color: C.rustBright, borderRadius: 6, padding: "4px 10px", fontSize: 12, cursor: "pointer" }
+            }, "Remover")
+          ))
+    )
+  );
+}
+
 function App() {
   const [games, setGames] = useState(loadGames());
+  const [settings, setSettings] = useState(loadSettings());
   const [tab, setTab] = useState("dashboard");
   const [pgnInput, setPgnInput] = useState("");
   const [source, setSource] = useState("chessis");
@@ -462,8 +704,46 @@ function App() {
   const [selectedGameId, setSelectedGameId] = useState(null);
   const [addStatus, setAddStatus] = useState(null);
   const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeProgress, setAnalyzeProgress] = useState(null);
+  // When side detection fails, we stash the pending add here and ask the user to pick.
+  const [pendingSideChoice, setPendingSideChoice] = useState(null);
 
   const persist = useCallback((next) => { setGames(next); saveGames(next); }, []);
+  const persistSettings = useCallback((next) => { setSettings(next); saveSettings(next); }, []);
+
+  const runAnalysisAndSave = async (pgnText, resolvedSide) => {
+    const parsed = parsePGN(pgnText);
+    let engineNote = "Classificação baseada nas anotações (!!/!/?!/?/??) presentes no PGN.";
+    let externalCounts = null;
+
+    if (engineMode === "lichess-cloud") {
+      const r = await analyzeWithLichessCloud(pgnText);
+      engineNote = r.ok
+        ? `Importado ao Lichess para análise: ${r.url}`
+        : "Análise via Lichess indisponível agora (bloqueio de navegador) — usando anotações do PGN como fallback.";
+    } else if (engineMode === "stockfish-js") {
+      setAnalyzeProgress({ current: 0, total: parsed.moves.length });
+      const r = await analyzeWithStockfish(pgnText, resolvedSide, (cur, tot) => setAnalyzeProgress({ current: cur, total: tot }));
+      setAnalyzeProgress(null);
+      if (r.ok) {
+        externalCounts = r.counts;
+        engineNote = "Analisado com Stockfish.js local, lance a lance, no seu navegador.";
+      } else {
+        engineNote = "Stockfish.js indisponível neste navegador agora — usando anotações do PGN como fallback.";
+      }
+    }
+
+    const kpis = computeGameKPIs({ parsed }, resolvedSide, externalCounts);
+    const newGame = {
+      id: `g_${Date.now()}`, source, engineMode, engineNote, resolvedSide,
+      addedAt: new Date().toISOString(), parsed, kpis,
+    };
+    const next = [...games, newGame];
+    persist(next);
+    setPgnInput("");
+    setAddStatus({ ok: true, msg: "Partida adicionada e analisada." });
+    setTab("dashboard");
+  };
 
   const handleAddGame = async () => {
     if (!pgnInput.trim()) { setAddStatus({ ok: false, msg: "Cole um PGN antes de adicionar." }); return; }
@@ -474,20 +754,27 @@ function App() {
         setAddStatus({ ok: false, msg: "Não consegui identificar lances nesse PGN. Verifique o formato." });
         setAnalyzing(false); return;
       }
-      let engineNote = "Classificação baseada nas anotações (!!/!/?!/?/??) presentes no PGN.";
-      if (engineMode === "lichess-cloud") {
-        const r = await analyzeWithLichessCloud(pgnInput);
-        engineNote = r.ok ? `Importado ao Lichess para análise: ${r.url}` : "Análise via Lichess indisponível agora — usando anotações do PGN como fallback.";
-      } else if (engineMode === "stockfish-js") {
-        engineNote = "Stockfish.js não está incluído nesta build — usando anotações do PGN como fallback.";
+      const side = detectUserSide(parsed.tags, settings.usernames);
+      if (side === "unknown") {
+        // Pause here and ask the user which color they played — resume via resolvePendingSide.
+        setPendingSideChoice({ pgnText: pgnInput, tags: parsed.tags });
+        setAnalyzing(false);
+        return;
       }
-      const kpis = computeGameKPIs({ parsed });
-      const newGame = { id: `g_${Date.now()}`, source, engineMode, engineNote, addedAt: new Date().toISOString(), parsed, kpis };
-      const next = [...games, newGame];
-      persist(next);
-      setPgnInput("");
-      setAddStatus({ ok: true, msg: "Partida adicionada e analisada." });
-      setTab("dashboard");
+      await runAnalysisAndSave(pgnInput, side);
+    } catch (e) {
+      setAddStatus({ ok: false, msg: "Erro ao processar o PGN: " + e.message });
+    }
+    setAnalyzing(false);
+  };
+
+  const resolvePendingSide = async (side) => {
+    if (!pendingSideChoice) return;
+    const { pgnText } = pendingSideChoice;
+    setPendingSideChoice(null);
+    setAnalyzing(true);
+    try {
+      await runAnalysisAndSave(pgnText, side);
     } catch (e) {
       setAddStatus({ ok: false, msg: "Erro ao processar o PGN: " + e.message });
     }
@@ -544,7 +831,7 @@ function App() {
           React.createElement("span", { style: { color: C.brassDim, fontSize: 13 } }, "KPIs de xadrez, não estatística vazia")
         ),
         React.createElement("div", { style: { display: "flex", gap: 6, marginTop: 18, flexWrap: "wrap" } },
-          [["dashboard", "Visão geral"], ["add", "Adicionar partida"], ["history", "Histórico"]].map(([key, label]) =>
+          [["dashboard", "Visão geral"], ["add", "Adicionar partida"], ["history", "Histórico"], ["settings", "Configurações"]].map(([key, label]) =>
             React.createElement("button", {
               key, onClick: () => setTab(key),
               style: { background: tab === key ? C.brass : "transparent", color: tab === key ? C.bg : C.inkDim, border: `1px solid ${tab === key ? C.brass : C.line}`, borderRadius: 6, padding: "7px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer" }
@@ -558,8 +845,17 @@ function App() {
         )
       )
     ),
+    pendingSideChoice && React.createElement(SideChoiceModal, {
+      tags: pendingSideChoice.tags,
+      onChoose: resolvePendingSide,
+      onCancel: () => setPendingSideChoice(null),
+    }),
+    analyzeProgress && React.createElement("div", {
+      style: { position: "fixed", bottom: 16, left: "50%", transform: "translateX(-50%)", background: C.bgPanel2, border: `1px solid ${C.brassDim}`, borderRadius: 8, padding: "10px 18px", fontSize: 13, color: C.brass, zIndex: 9998 }
+    }, `Analisando com Stockfish… lance ${analyzeProgress.current}/${analyzeProgress.total}`),
     React.createElement("div", { style: { maxWidth: 880, margin: "0 auto", padding: "24px 20px" } },
       tab === "add" ? React.createElement(AddGameView, { pgnInput, setPgnInput, source, setSource, engineMode, setEngineMode, onAdd: handleAddGame, analyzing, status: addStatus })
+      : tab === "settings" ? React.createElement(SettingsView, { settings, onSave: persistSettings })
       : tab === "history" ? React.createElement(HistoryView, { games, onSelect: (id) => { setSelectedGameId(id); setTab("game"); }, onDelete: handleDeleteGame })
       : tab === "game" && selectedGame ? React.createElement(GameDetailView, { game: selectedGame, onBack: () => setTab("history") })
       : React.createElement(DashboardView, { games, agg, agg20, last20, tips, onGoAdd: () => setTab("add"), onGoHistory: () => setTab("history"), onSelectGame: (id) => { setSelectedGameId(id); setTab("game"); } })
