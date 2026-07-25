@@ -212,19 +212,40 @@ function getStockfishWorker() {
   if (_sfWorker) return _sfReady;
   _sfReady = new Promise((resolve, reject) => {
     try {
-      const worker = new Worker("https://cdn.jsdelivr.net/npm/stockfish@16.0.0/src/stockfish-nnue-16-single.js");
+      // Confirmed on npmjs.com/package/stockfish: version 18.x ships fixed (non-hashed)
+      // filenames — stockfish-18-lite-single.js is the lite single-threaded WASM build,
+      // ~7MB, runs without special CORS/COEP headers. Pinned to 18.0.0 rather than "latest"
+      // so the filename contract doesn't shift under us again.
+      const workerUrl = "https://cdn.jsdelivr.net/npm/stockfish@18.0.0/src/stockfish-18-lite-single.js";
+      const worker = new Worker(workerUrl);
+      let handshakeDone = false;
+
+      worker.addEventListener("error", (err) => {
+        console.error("Stockfish worker error (script load or runtime):", err.message || err, "URL:", workerUrl);
+        if (!handshakeDone) reject(err);
+      });
+
       const onFirstMessage = (e) => {
         if (String(e.data).includes("uciok") || String(e.data).includes("Stockfish")) {
+          handshakeDone = true;
+          console.log("Stockfish handshake OK:", e.data);
           worker.removeEventListener("message", onFirstMessage);
           resolve(worker);
         }
       };
       worker.addEventListener("message", onFirstMessage);
-      worker.addEventListener("error", (err) => reject(err));
       worker.postMessage("uci");
       _sfWorker = worker;
-      // Safety timeout: some CDN builds respond slowly or with different handshake text.
-      setTimeout(() => resolve(worker), 4000);
+      // Safety fallback: some builds respond with different handshake text than expected.
+      // If we haven't resolved by 4s, log it clearly instead of silently proceeding —
+      // this makes "engine loaded but never spoke" visible and distinguishable from
+      // "engine failed to load at all" (which fires the error listener above instead).
+      setTimeout(() => {
+        if (!handshakeDone) {
+          console.warn("Stockfish handshake timeout — proceeding anyway, but engine may not respond correctly.");
+          resolve(worker);
+        }
+      }, 4000);
     } catch (err) {
       reject(err);
     }
@@ -304,12 +325,16 @@ function bucketFromCpLoss(cpLoss) {
 // Progress callback receives (currentPly, totalPlies) for UI feedback.
 async function analyzeWithStockfish(rawPgn, side, onProgress) {
   const plies = buildPlyList(rawPgn);
-  if (!plies) return { ok: false, reason: "parse_failed" };
+  if (!plies) {
+    console.error("Stockfish analysis: buildPlyList failed — PGN could not be parsed by chess.js. Is `Chess` defined?", typeof Chess);
+    return { ok: false, reason: "parse_failed" };
+  }
 
   let worker;
   try {
     worker = await getStockfishWorker();
   } catch (e) {
+    console.error("Stockfish analysis: worker failed to initialize.", e);
     return { ok: false, reason: "worker_failed" };
   }
 
