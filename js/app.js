@@ -118,11 +118,25 @@ function saveSettings(settings) {
 // Public CORS proxy — routes the browser's request through a third-party relay so the
 // Lichess API (which doesn't allow direct cross-origin calls) can be reached from a static
 // site with no backend of its own. This is a convenience for testing: it depends on a free
-// third-party service staying up, and isn't something to rely on long-term.
+// third-party service staying up and correctly passing through POST bodies, and isn't
+// something to rely on long-term. If this proxy starts failing, swap the constant below.
 const CORS_PROXY = "https://corsproxy.io/?url=";
 
 async function lichessFetch(url, options) {
-  return fetch(CORS_PROXY + encodeURIComponent(url), options);
+  const res = await fetch(CORS_PROXY + encodeURIComponent(url), options);
+  return res;
+}
+
+// Guards against proxies that fail "successfully" — returning HTTP 200 with an HTML error
+// page instead of the real JSON/PGN payload. Throws a clear error instead of letting
+// JSON.parse() fail later with a confusing "Unexpected token '<'" message.
+async function assertJsonResponse(res) {
+  const text = await res.text();
+  const trimmed = text.trim();
+  if (trimmed.startsWith("<")) {
+    throw new Error("Proxy returned an HTML page instead of JSON — the CORS proxy is likely down or rate-limiting.");
+  }
+  return JSON.parse(trimmed);
 }
 
 // Extracts [%eval ...] annotations from a Lichess-analysed PGN's movetext and returns them
@@ -159,7 +173,13 @@ async function analyzeWithLichessCloud(pgn, side, onProgress) {
       console.error("Lichess: import request failed, status", importRes.status);
       return { ok: false, reason: "import_failed" };
     }
-    const data = await importRes.json();
+    let data;
+    try {
+      data = await assertJsonResponse(importRes);
+    } catch (parseErr) {
+      console.error("Lichess: import response was not valid JSON.", parseErr.message);
+      return { ok: false, reason: "proxy_html_response" };
+    }
     console.log("Lichess: import response", data);
     const gameId = data.id;
     if (!gameId) {
@@ -237,7 +257,7 @@ function getStockfishWorker() {
       // filenames — stockfish-18-lite-single.js is the lite single-threaded WASM build,
       // ~7MB, runs without special CORS/COEP headers. Pinned to 18.0.0 rather than "latest"
       // so the filename contract doesn't shift under us again.
-      const workerUrl = "https://cdn.jsdelivr.net/npm/stockfish@18.0.0/src/stockfish-18-lite-single.js";
+      const workerUrl = "https://unpkg.com/stockfish@18.0.0/src/stockfish-18-lite-single.js";
 
       // Browsers block `new Worker(crossOriginUrl)` directly (same-origin policy on Worker
       // construction). The standard workaround: create the worker from a same-origin Blob
@@ -857,6 +877,8 @@ function App() {
         engineNote = `Analisado pelo motor do Lichess (via proxy CORS). Partida importada: ${r.url}`;
       } else if (r.reason === "analysis_not_ready") {
         engineNote = `Lichess ainda não terminou de analisar essa partida — tente de novo em ~1 min, ou veja em: ${r.url}. Usando anotações do PGN como fallback por enquanto.`;
+      } else if (r.reason === "proxy_html_response") {
+        engineNote = "O proxy CORS gratuito usado para acessar o Lichess está fora do ar ou bloqueando agora — isso é uma limitação conhecida de depender de um serviço de terceiro grátis. Recomendo usar o modo Stockfish.js, que roda local e não depende de proxy. Usando anotações do PGN como fallback por enquanto.";
       } else {
         engineNote = "Análise via Lichess indisponível agora (proxy ou rede) — usando anotações do PGN como fallback.";
       }
