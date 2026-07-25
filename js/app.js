@@ -35,6 +35,28 @@ function classifyMoves(moves) {
   return counts;
 }
 
+// Splits the flat move list (White, Black, White, Black, ...) into each side's moves.
+function splitMovesBySide(moves) {
+  const white = [];
+  const black = [];
+  moves.forEach((mv, i) => {
+    if (i % 2 === 0) white.push(mv);
+    else black.push(mv);
+  });
+  return { white, black };
+}
+
+// Returns only the moves belonging to "Você" (the user), based on the White/Black PGN tags.
+function userMoves(moves, tags) {
+  const { white, black } = splitMovesBySide(moves);
+  const userIsWhite = /voc[eê]/i.test(tags.White || "");
+  const userIsBlack = /voc[eê]/i.test(tags.Black || "");
+  if (userIsBlack && !userIsWhite) return black;
+  if (userIsWhite && !userIsBlack) return white;
+  // Fallback: if we can't tell who's "Você" from tags, keep all moves rather than guessing wrong.
+  return moves;
+}
+
 function detectResult(tags) {
   const r = tags.Result || "*";
   const userIsWhite = /voc[eê]/i.test(tags.White || "");
@@ -81,12 +103,18 @@ async function analyzeWithLichessCloud(pgn) {
 
 // ---------- KPI computation ----------
 function computeGameKPIs(game) {
-  const { moves } = game.parsed;
-  const counts = classifyMoves(moves);
+  const { moves, tags } = game.parsed;
+  // Only classify the user's own moves — mixing both sides was inflating error counts
+  // with the opponent's mistakes/brilliancies.
+  const mine = userMoves(moves, tags);
+  const counts = classifyMoves(mine);
   const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
   const errorWeight = counts.blunder * 3 + counts.mistake * 2 + counts.inaccuracy * 1;
   const errorRate = errorWeight / total;
-  const phases = { opening: moves.slice(0, 12), middlegame: moves.slice(12, 32), endgame: moves.slice(32) };
+  // Phase split operates on the user's move subset (each entry here is one of the user's
+  // own plies, already every-other-ply from the raw PGN), so slice sizes are halved
+  // relative to full-game ply counts.
+  const phases = { opening: mine.slice(0, 6), middlegame: mine.slice(6, 16), endgame: mine.slice(16) };
   const phaseErr = {};
   Object.entries(phases).forEach(([k, arr]) => {
     const c = classifyMoves(arr);
@@ -338,7 +366,7 @@ function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, set
         React.createElement("label", { style: labelStyle }, "Modo de análise"),
         React.createElement("select", { value: engineMode, onChange: (e) => setEngineMode(e.target.value), style: selectStyle },
           React.createElement("option", { value: "none" }, "Sem engine (usa anotações do PGN)"),
-          React.createElement("option", { value: "lichess-cloud" }, "API do Lichess (cloud)"),
+          React.createElement("option", { value: "lichess-cloud" }, "API do Lichess (cloud) — experimental"),
           React.createElement("option", { value: "stockfish-js" }, "Stockfish.js no navegador")
         )
       )
@@ -357,7 +385,7 @@ function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, set
       style: { background: analyzing ? C.brassDim : C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "12px 24px", fontWeight: 700, fontSize: 14, cursor: analyzing ? "default" : "pointer", width: "100%" }
     }, analyzing ? "Analisando…" : "Adicionar e analisar"),
     React.createElement("p", { style: { fontSize: 12, color: C.inkFaint, marginTop: 12, lineHeight: 1.6 } },
-      "Nota sobre engines: o modo \"sem engine\" usa as anotações (!!, !, ?!, ?, ??) já presentes no PGN exportado. O modo Lichess cloud importa a partida para análise externa. O modo Stockfish.js depende do navegador suportar WebAssembly."
+      "Nota sobre engines: o modo \"sem engine\" usa as anotações (!!, !, ?!, ?, ??) já presentes no PGN exportado — é o modo recomendado e o que já funciona de ponta a ponta. O modo Lichess cloud e o Stockfish.js ainda são experimentais nesta versão: navegadores bloqueiam chamadas diretas ao Lichess por segurança (CORS), então esses modos caem automaticamente no fallback de anotações."
     )
   );
 }
