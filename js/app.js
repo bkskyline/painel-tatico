@@ -1,0 +1,542 @@
+const { useState, useEffect, useCallback, useMemo } = React;
+
+// ---------- Design tokens ----------
+const C = {
+  bg: "#15140f", bgPanel: "#1d1c15", bgPanel2: "#242219", line: "#33301f",
+  ink: "#ece6d6", inkDim: "#a39c85", inkFaint: "#726b56",
+  brass: "#c9a24b", brassDim: "#8a713a", felt: "#4f7a5c", feltBright: "#6fae7f",
+  rust: "#b5533c", rustBright: "#d97052", sky: "#5a8fae",
+};
+
+// ---------- PGN parsing ----------
+function parsePGN(pgn) {
+  const tagMatches = [...pgn.matchAll(/\[(\w+)\s+"([^"]*)"\]/g)];
+  const tags = {};
+  tagMatches.forEach((m) => (tags[m[1]] = m[2]));
+  let body = pgn.replace(/\[(\w+)\s+"([^"]*)"\]/g, "").trim();
+  body = body.replace(/\{[^}]*\}/g, "");
+  body = body.replace(/\$\d+/g, "");
+  body = body.replace(/\([^()]*\)/g, "");
+  body = body.replace(/(1-0|0-1|1\/2-1\/2|\*)\s*$/, "").trim();
+  const moveTokens = body.split(/\s+/).filter((t) => t && !/^\d+\.(\.\.)?$/.test(t) && !/^\d+\.$/.test(t));
+  return { tags, moves: moveTokens, raw: pgn };
+}
+
+function classifyMoves(moves) {
+  const counts = { genius: 0, best: 0, good: 0, inaccuracy: 0, mistake: 0, blunder: 0 };
+  moves.forEach((mv) => {
+    if (/!!$/.test(mv)) counts.genius++;
+    else if (/\?\?$/.test(mv)) counts.blunder++;
+    else if (/\?!$/.test(mv)) counts.inaccuracy++;
+    else if (/\?$/.test(mv)) counts.mistake++;
+    else if (/!$/.test(mv)) counts.best++;
+    else counts.good++;
+  });
+  return counts;
+}
+
+function detectResult(tags) {
+  const r = tags.Result || "*";
+  const userIsWhite = /voc[eê]/i.test(tags.White || "");
+  const userIsBlack = /voc[eê]/i.test(tags.Black || "");
+  let outcome = "desconhecido";
+  if (r === "1-0") outcome = userIsWhite ? "vitória" : userIsBlack ? "derrota" : "brancas venceram";
+  else if (r === "0-1") outcome = userIsBlack ? "vitória" : userIsWhite ? "derrota" : "pretas venceram";
+  else if (r === "1/2-1/2") outcome = "empate";
+  return { outcome, userColor: userIsWhite ? "white" : userIsBlack ? "black" : "unknown" };
+}
+
+function openingFamily(ecoOrName) {
+  if (!ecoOrName) return "Desconhecida";
+  const s = ecoOrName.split(":")[0].trim();
+  return s || ecoOrName;
+}
+
+// ---------- Storage (localStorage-backed) ----------
+const GAMES_KEY = "chesskpi:games";
+function loadGames() {
+  try {
+    const raw = localStorage.getItem(GAMES_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
+}
+function saveGames(games) {
+  try { localStorage.setItem(GAMES_KEY, JSON.stringify(games)); }
+  catch (e) { console.error("localStorage set failed", e); }
+}
+
+// ---------- Engine adapters ----------
+async function analyzeWithLichessCloud(pgn) {
+  try {
+    const importRes = await fetch("https://lichess.org/api/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "pgn=" + encodeURIComponent(pgn),
+    });
+    if (!importRes.ok) return { ok: false, reason: "import_failed" };
+    const data = await importRes.json();
+    return { ok: true, url: data.url, id: data.id };
+  } catch (e) { return { ok: false, reason: "network" }; }
+}
+
+// ---------- KPI computation ----------
+function computeGameKPIs(game) {
+  const { moves } = game.parsed;
+  const counts = classifyMoves(moves);
+  const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
+  const errorWeight = counts.blunder * 3 + counts.mistake * 2 + counts.inaccuracy * 1;
+  const errorRate = errorWeight / total;
+  const phases = { opening: moves.slice(0, 12), middlegame: moves.slice(12, 32), endgame: moves.slice(32) };
+  const phaseErr = {};
+  Object.entries(phases).forEach(([k, arr]) => {
+    const c = classifyMoves(arr);
+    const t = Object.values(c).reduce((a, b) => a + b, 0) || 1;
+    phaseErr[k] = (c.blunder * 3 + c.mistake * 2 + c.inaccuracy) / t;
+  });
+  const weakestPhase = Object.entries(phaseErr).sort((a, b) => b[1] - a[1])[0]?.[0] || "middlegame";
+  return { counts, errorRate, phaseErr, weakestPhase, totalMoves: total };
+}
+
+function aggregateKPIs(games) {
+  if (games.length === 0) return null;
+  const byOpening = {};
+  let wins = 0, losses = 0, draws = 0, totalErrorRate = 0;
+  const phaseAgg = { opening: [], middlegame: [], endgame: [] };
+  games.forEach((g) => {
+    const fam = openingFamily(g.parsed.tags.Opening || g.parsed.tags.ECO);
+    const result = detectResult(g.parsed.tags);
+    if (!byOpening[fam]) byOpening[fam] = { games: 0, wins: 0, losses: 0, draws: 0, errorRateSum: 0 };
+    byOpening[fam].games++;
+    if (result.outcome === "vitória") { byOpening[fam].wins++; wins++; }
+    else if (result.outcome === "derrota") { byOpening[fam].losses++; losses++; }
+    else if (result.outcome === "empate") { byOpening[fam].draws++; draws++; }
+    byOpening[fam].errorRateSum += g.kpis.errorRate;
+    totalErrorRate += g.kpis.errorRate;
+    Object.entries(g.kpis.phaseErr).forEach(([k, v]) => phaseAgg[k].push(v));
+  });
+  const avgPhaseErr = {};
+  Object.entries(phaseAgg).forEach(([k, arr]) => { avgPhaseErr[k] = arr.reduce((a, b) => a + b, 0) / (arr.length || 1); });
+  const openingStats = Object.entries(byOpening).map(([name, s]) => ({
+    name, games: s.games, winRate: s.wins / s.games, lossRate: s.losses / s.games, avgErrorRate: s.errorRateSum / s.games,
+  })).sort((a, b) => b.games - a.games);
+  return {
+    totalGames: games.length, wins, losses, draws, winPct: wins / games.length,
+    avgErrorRate: totalErrorRate / games.length, avgPhaseErr,
+    weakestPhaseOverall: Object.entries(avgPhaseErr).sort((a, b) => b[1] - a[1])[0][0],
+    openingStats,
+  };
+}
+
+function generateTips(agg, games) {
+  if (!agg || games.length === 0) return [];
+  const tips = [];
+  const phaseNames = { opening: "abertura", middlegame: "meio-jogo", endgame: "final" };
+  const wp = agg.weakestPhaseOverall;
+  tips.push({
+    title: `Foco de treino: ${phaseNames[wp]}`,
+    body: `Sua taxa de erro ponderada é mais alta no ${phaseNames[wp]} (${(agg.avgPhaseErr[wp] * 100).toFixed(1)}%) comparado às outras fases. Isso indica onde seus pontos perdidos se concentram.`,
+    action: wp === "opening" ? "Prática recomendada: puzzles de abertura com tempo curto — 15 min/dia."
+      : wp === "middlegame" ? "Prática recomendada: puzzles táticos temáticos (garfos, cravadas, ataques duplos)."
+      : "Prática recomendada: finais de peão e torre básicos.",
+  });
+  const viable = agg.openingStats.filter((o) => o.games >= 2);
+  const best = viable.sort((a, b) => b.winRate - a.winRate)[0];
+  if (best) {
+    tips.push({
+      title: `Sua melhor abertura: ${best.name}`,
+      body: `Em ${best.games} partida(s), você tem ${(best.winRate * 100).toFixed(0)}% de vitórias e erro médio de ${(best.avgErrorRate * 100).toFixed(1)}%.`,
+      action: "Sugestão: aprofunde essa linha em vez de diversificar repertório agora.",
+    });
+  }
+  const worst = viable.sort((a, b) => a.winRate - b.winRate)[0];
+  if (worst && worst.name !== best?.name) {
+    tips.push({
+      title: `Abertura a revisar: ${worst.name}`,
+      body: `Taxa de vitória de ${(worst.winRate * 100).toFixed(0)}% e erro médio de ${(worst.avgErrorRate * 100).toFixed(1)}% em ${worst.games} partidas.`,
+      action: "Sugestão: estude a fundo ou evite temporariamente até fechar o gap de erro.",
+    });
+  }
+  const totalBlunders = games.reduce((sum, g) => sum + g.kpis.counts.blunder, 0);
+  const totalGenius = games.reduce((sum, g) => sum + g.kpis.counts.genius, 0);
+  if (totalBlunders > 0) {
+    tips.push({
+      title: `Controle de erro grave`,
+      body: `${totalBlunders} erro(s) grave(s) (??) contra ${totalGenius} lance(s) geniais (!!) — capacidade tática alta, mas inconsistente.`,
+      action: "Sugestão: antes de cada lance não-forçado, pergunte 'o que meu oponente ameaça se eu não fizer nada'.",
+    });
+  } else {
+    tips.push({
+      title: `Consistência tática`,
+      body: `Nenhum erro grave registrado — sinal forte de disciplina tática.`,
+      action: "Sugestão: suba o nível dos oponentes para achar seu teto real.",
+    });
+  }
+  if (games.length >= 3) {
+    const sorted = [...games].sort((a, b) => new Date(a.addedAt) - new Date(b.addedAt));
+    const half = Math.floor(sorted.length / 2);
+    const firstHalfErr = sorted.slice(0, half).reduce((s, g) => s + g.kpis.errorRate, 0) / (half || 1);
+    const secondHalfErr = sorted.slice(half).reduce((s, g) => s + g.kpis.errorRate, 0) / (sorted.length - half || 1);
+    const improving = secondHalfErr < firstHalfErr;
+    tips.push({
+      title: improving ? "Tendência de melhora confirmada" : "Tendência de erro subindo",
+      body: improving
+        ? `Erro caiu de ${(firstHalfErr * 100).toFixed(1)}% para ${(secondHalfErr * 100).toFixed(1)}%.`
+        : `Erro subiu de ${(firstHalfErr * 100).toFixed(1)}% para ${(secondHalfErr * 100).toFixed(1)}%.`,
+      action: improving ? "Sugestão: suba a dificuldade do oponente gradualmente." : "Sugestão: reduza volume por sessão por 1-2 semanas.",
+    });
+  } else {
+    tips.push({
+      title: "Volume de dados ainda baixo",
+      body: `Com ${games.length} partida(s), tendências ainda não são confiáveis.`,
+      action: "Sugestão: adicione pelo menos 5-10 partidas.",
+    });
+  }
+  return tips.slice(0, 5);
+}
+
+// ---------- UI subcomponents ----------
+function Stat({ label, value, accent }) {
+  return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 4 } },
+    React.createElement("span", { style: { fontSize: 11, letterSpacing: "0.06em", textTransform: "uppercase", color: C.inkFaint } }, label),
+    React.createElement("span", { style: { fontFamily: "Georgia, serif", fontSize: 28, color: accent || C.ink, fontVariantNumeric: "tabular-nums" } }, value)
+  );
+}
+
+function Pill({ children, tone }) {
+  const bg = tone === "good" ? "rgba(111,174,127,0.15)" : tone === "bad" ? "rgba(181,83,60,0.15)" : "rgba(201,162,75,0.12)";
+  const fg = tone === "good" ? C.feltBright : tone === "bad" ? C.rustBright : C.brass;
+  return React.createElement("span", { style: { background: bg, color: fg, padding: "3px 10px", borderRadius: 999, fontSize: 12, fontWeight: 600 } }, children);
+}
+
+function Bar({ pct, tone }) {
+  const fg = tone === "good" ? C.feltBright : tone === "bad" ? C.rustBright : C.brass;
+  return React.createElement("div", { style: { width: "100%", height: 6, background: C.line, borderRadius: 3, overflow: "hidden" } },
+    React.createElement("div", { style: { width: `${Math.min(100, pct * 100)}%`, height: "100%", background: fg, borderRadius: 3, transition: "width 0.4s ease" } })
+  );
+}
+
+function SectionLabel({ children }) {
+  return React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 14 } },
+    React.createElement("span", { style: { width: 8, height: 8, background: C.brass, borderRadius: 1, transform: "rotate(45deg)" } }),
+    React.createElement("span", { style: { fontSize: 12, letterSpacing: "0.08em", textTransform: "uppercase", color: C.inkFaint, fontWeight: 600 } }, children)
+  );
+}
+
+function GameRow({ game, onClick }) {
+  const result = detectResult(game.parsed.tags);
+  const tone = result.outcome === "vitória" ? "good" : result.outcome === "derrota" ? "bad" : "neutral";
+  return React.createElement("button", {
+    onClick, style: { display: "flex", justifyContent: "space-between", alignItems: "center", background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "12px 16px", cursor: "pointer", textAlign: "left", width: "100%", color: C.ink }
+  },
+    React.createElement("div", null,
+      React.createElement("div", { style: { fontSize: 13.5, fontWeight: 600 } }, `${game.parsed.tags.White || "?"} vs ${game.parsed.tags.Black || "?"}`),
+      React.createElement("div", { style: { fontSize: 12, color: C.inkFaint, marginTop: 2 } }, `${openingFamily(game.parsed.tags.Opening || game.parsed.tags.ECO || "Abertura desconhecida")} · ${game.source}`)
+    ),
+    React.createElement(Pill, { tone }, result.outcome)
+  );
+}
+
+function DashboardView({ games, agg, agg20, last20, tips, onGoAdd, onGoHistory, onSelectGame }) {
+  if (games.length === 0) {
+    return React.createElement("div", { style: { textAlign: "center", padding: "60px 20px", border: `1px dashed ${C.line}`, borderRadius: 10 } },
+      React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 20, marginBottom: 8 } }, "Nenhuma partida ainda"),
+      React.createElement("p", { style: { color: C.inkDim, fontSize: 14, marginBottom: 20 } }, "Adicione seu primeiro PGN para começar a ver KPIs reais."),
+      React.createElement("button", { onClick: onGoAdd, style: { background: C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "10px 20px", fontWeight: 700, cursor: "pointer" } }, "Adicionar partida")
+    );
+  }
+  const phaseLabels = { opening: "Abertura", middlegame: "Meio-jogo", endgame: "Final" };
+  return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 32 } },
+    React.createElement("div", null,
+      React.createElement(SectionLabel, null, `Últimas ${last20.length} partidas`),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 16, background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 20 } },
+        React.createElement(Stat, { label: "Taxa de vitória", value: `${(agg20.winPct * 100).toFixed(0)}%`, accent: C.feltBright }),
+        React.createElement(Stat, { label: "V / E / D", value: `${agg20.wins}/${agg20.draws}/${agg20.losses}` }),
+        React.createElement(Stat, { label: "Erro médio ponderado", value: `${(agg20.avgErrorRate * 100).toFixed(1)}%`, accent: agg20.avgErrorRate > 0.15 ? C.rustBright : C.feltBright }),
+        React.createElement(Stat, { label: "Fase mais fraca", value: phaseLabels[agg20.weakestPhaseOverall], accent: C.brass })
+      )
+    ),
+    React.createElement("div", null,
+      React.createElement(SectionLabel, null, `Erro por fase (últimas ${last20.length})`),
+      React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14, background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 20 } },
+        Object.entries(phaseLabels).map(([key, label]) => {
+          const v = agg20.avgPhaseErr[key];
+          const isWorst = key === agg20.weakestPhaseOverall;
+          return React.createElement("div", { key },
+            React.createElement("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 6 } },
+              React.createElement("span", { style: { color: isWorst ? C.rustBright : C.inkDim, fontWeight: isWorst ? 700 : 400 } }, label),
+              React.createElement("span", { style: { color: C.inkFaint, fontVariantNumeric: "tabular-nums" } }, `${(v * 100).toFixed(1)}%`)
+            ),
+            React.createElement(Bar, { pct: v * 4, tone: isWorst ? "bad" : "neutral" })
+          );
+        })
+      )
+    ),
+    React.createElement("div", null,
+      React.createElement(SectionLabel, null, "5 recomendações práticas"),
+      React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 12 } },
+        tips.map((tip, i) => React.createElement("div", { key: i, style: { background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 18 } },
+          React.createElement("div", { style: { display: "flex", gap: 12, alignItems: "flex-start" } },
+            React.createElement("span", { style: { fontFamily: "Georgia, serif", fontSize: 18, color: C.brass, width: 28, height: 28, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", border: `1px solid ${C.brassDim}`, borderRadius: "50%" } }, i + 1),
+            React.createElement("div", { style: { flex: 1 } },
+              React.createElement("p", { style: { fontWeight: 700, fontSize: 15, margin: "2px 0 6px" } }, tip.title),
+              React.createElement("p", { style: { color: C.inkDim, fontSize: 13.5, lineHeight: 1.6, margin: "0 0 8px" } }, tip.body),
+              React.createElement("p", { style: { color: C.feltBright, fontSize: 13, fontWeight: 600, margin: 0 } }, `→ ${tip.action}`)
+            )
+          )
+        ))
+      )
+    ),
+    React.createElement("div", null,
+      React.createElement(SectionLabel, null, `Desempenho por abertura (todas as ${games.length} partidas)`),
+      React.createElement("div", { style: { background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden" } },
+        React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 13 } },
+          React.createElement("thead", null,
+            React.createElement("tr", { style: { borderBottom: `1px solid ${C.line}`, color: C.inkFaint, textAlign: "left" } },
+              ["Abertura", "Jogos", "Vitórias", "Erro médio"].map((h) => React.createElement("th", { key: h, style: { padding: "10px 16px", fontWeight: 600, fontSize: 11, textTransform: "uppercase" } }, h))
+            )
+          ),
+          React.createElement("tbody", null,
+            agg.openingStats.map((o) => React.createElement("tr", { key: o.name, style: { borderBottom: `1px solid ${C.line}` } },
+              React.createElement("td", { style: { padding: "10px 16px" } }, o.name),
+              React.createElement("td", { style: { padding: "10px 16px", color: C.inkDim } }, o.games),
+              React.createElement("td", { style: { padding: "10px 16px" } }, React.createElement(Pill, { tone: o.winRate >= 0.5 ? "good" : "bad" }, `${(o.winRate * 100).toFixed(0)}%`)),
+              React.createElement("td", { style: { padding: "10px 16px", color: o.avgErrorRate > 0.15 ? C.rustBright : C.inkDim } }, `${(o.avgErrorRate * 100).toFixed(1)}%`)
+            ))
+          )
+        )
+      )
+    ),
+    React.createElement("div", null,
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 } },
+        React.createElement(SectionLabel, null, "Partidas recentes"),
+        React.createElement("button", { onClick: onGoHistory, style: { background: "none", border: "none", color: C.brass, fontSize: 12.5, cursor: "pointer", fontWeight: 600 } }, "Ver histórico completo →")
+      ),
+      React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
+        [...games].slice(-5).reverse().map((g) => React.createElement(GameRow, { key: g.id, game: g, onClick: () => onSelectGame(g.id) }))
+      )
+    )
+  );
+}
+
+function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, setEngineMode, onAdd, analyzing, status }) {
+  const labelStyle = { fontSize: 12, letterSpacing: "0.05em", textTransform: "uppercase", color: C.inkFaint, marginBottom: 8, display: "block", fontWeight: 600 };
+  const selectStyle = { width: "100%", background: C.bgPanel2, border: `1px solid ${C.line}`, borderRadius: 6, color: C.ink, padding: "10px 12px", fontSize: 14 };
+  return React.createElement("div", { style: { maxWidth: 640, margin: "0 auto" } },
+    React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 22, marginBottom: 4 } }, "Adicionar partida"),
+    React.createElement("p", { style: { color: C.inkDim, fontSize: 13.5, marginBottom: 24 } }, "Cole o PGN de qualquer fonte — Chessis, Lichess, Chess.com ou manual."),
+    React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 } },
+      React.createElement("div", null,
+        React.createElement("label", { style: labelStyle }, "Fonte"),
+        React.createElement("select", { value: source, onChange: (e) => setSource(e.target.value), style: selectStyle },
+          React.createElement("option", { value: "chessis" }, "Chessis"),
+          React.createElement("option", { value: "lichess" }, "Lichess"),
+          React.createElement("option", { value: "chesscom" }, "Chess.com"),
+          React.createElement("option", { value: "manual" }, "PGN manual")
+        )
+      ),
+      React.createElement("div", null,
+        React.createElement("label", { style: labelStyle }, "Modo de análise"),
+        React.createElement("select", { value: engineMode, onChange: (e) => setEngineMode(e.target.value), style: selectStyle },
+          React.createElement("option", { value: "none" }, "Sem engine (usa anotações do PGN)"),
+          React.createElement("option", { value: "lichess-cloud" }, "API do Lichess (cloud)"),
+          React.createElement("option", { value: "stockfish-js" }, "Stockfish.js no navegador")
+        )
+      )
+    ),
+    React.createElement("label", { style: labelStyle }, "PGN"),
+    React.createElement("textarea", {
+      value: pgnInput, onChange: (e) => setPgnInput(e.target.value),
+      placeholder: '[Event "..."]\n1. e4 c5 2. b3 ...', rows: 12,
+      style: { width: "100%", background: C.bgPanel2, border: `1px solid ${C.line}`, borderRadius: 8, color: C.ink, padding: 14, fontFamily: "monospace", fontSize: 13, resize: "vertical", marginBottom: 16 }
+    }),
+    status && React.createElement("div", {
+      style: { padding: "10px 14px", borderRadius: 6, marginBottom: 16, fontSize: 13, background: status.ok ? "rgba(111,174,127,0.12)" : "rgba(181,83,60,0.12)", color: status.ok ? C.feltBright : C.rustBright }
+    }, status.msg),
+    React.createElement("button", {
+      onClick: onAdd, disabled: analyzing,
+      style: { background: analyzing ? C.brassDim : C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "12px 24px", fontWeight: 700, fontSize: 14, cursor: analyzing ? "default" : "pointer", width: "100%" }
+    }, analyzing ? "Analisando…" : "Adicionar e analisar"),
+    React.createElement("p", { style: { fontSize: 12, color: C.inkFaint, marginTop: 12, lineHeight: 1.6 } },
+      "Nota sobre engines: o modo \"sem engine\" usa as anotações (!!, !, ?!, ?, ??) já presentes no PGN exportado. O modo Lichess cloud importa a partida para análise externa. O modo Stockfish.js depende do navegador suportar WebAssembly."
+    )
+  );
+}
+
+function HistoryView({ games, onSelect, onDelete }) {
+  if (games.length === 0) return React.createElement("p", { style: { color: C.inkDim, textAlign: "center", padding: 40 } }, "Nenhuma partida registrada ainda.");
+  return React.createElement("div", null,
+    React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 22, marginBottom: 20 } }, `Histórico completo (${games.length})`),
+    React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
+      [...games].reverse().map((g) => {
+        const result = detectResult(g.parsed.tags);
+        const tone = result.outcome === "vitória" ? "good" : result.outcome === "derrota" ? "bad" : "neutral";
+        return React.createElement("div", { key: g.id, style: { display: "flex", justifyContent: "space-between", alignItems: "center", background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "12px 16px" } },
+          React.createElement("button", { onClick: () => onSelect(g.id), style: { background: "none", border: "none", color: C.ink, textAlign: "left", cursor: "pointer", flex: 1 } },
+            React.createElement("div", { style: { fontSize: 13.5, fontWeight: 600 } }, `${g.parsed.tags.White || "?"} vs ${g.parsed.tags.Black || "?"}`),
+            React.createElement("div", { style: { fontSize: 12, color: C.inkFaint, marginTop: 2 } }, `${new Date(g.addedAt).toLocaleDateString("pt-BR")} · ${g.source} · erro ${(g.kpis.errorRate * 100).toFixed(1)}%`)
+          ),
+          React.createElement("div", { style: { display: "flex", gap: 10, alignItems: "center" } },
+            React.createElement(Pill, { tone }, result.outcome),
+            React.createElement("button", { onClick: () => onDelete(g.id), style: { background: "none", border: `1px solid ${C.line}`, color: C.rustBright, borderRadius: 6, padding: "5px 10px", fontSize: 12, cursor: "pointer" } }, "Remover")
+          )
+        );
+      })
+    )
+  );
+}
+
+function GameDetailView({ game, onBack }) {
+  const result = detectResult(game.parsed.tags);
+  const { counts, errorRate, phaseErr, weakestPhase } = game.kpis;
+  const phaseNames = { opening: "Abertura", middlegame: "Meio-jogo", endgame: "Final" };
+  const rows = [
+    ["genius", "Gênio (!!)", C.brass], ["best", "Preciso (!)", C.feltBright], ["good", "Bom", C.sky],
+    ["inaccuracy", "Imprecisão (?!)", "#c9974b"], ["mistake", "Erro (?)", C.rustBright], ["blunder", "Erro grave (??)", "#8a2f1f"],
+  ];
+  return React.createElement("div", null,
+    React.createElement("button", { onClick: onBack, style: { background: "none", border: "none", color: C.brass, fontSize: 13, cursor: "pointer", marginBottom: 16, fontWeight: 600 } }, "← Voltar"),
+    React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 22, marginBottom: 4 } }, `${game.parsed.tags.White || "?"} vs ${game.parsed.tags.Black || "?"}`),
+    React.createElement("p", { style: { color: C.inkDim, fontSize: 13.5, marginBottom: 20 } }, `${openingFamily(game.parsed.tags.Opening || game.parsed.tags.ECO)} · ${new Date(game.addedAt).toLocaleDateString("pt-BR")} · Resultado: ${result.outcome}`),
+    React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px,1fr))", gap: 16, background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 20, marginBottom: 20 } },
+      React.createElement(Stat, { label: "Erro ponderado", value: `${(errorRate * 100).toFixed(1)}%`, accent: errorRate > 0.15 ? C.rustBright : C.feltBright }),
+      React.createElement(Stat, { label: "Lances geniais", value: counts.genius, accent: C.brass }),
+      React.createElement(Stat, { label: "Erros graves", value: counts.blunder, accent: counts.blunder > 0 ? C.rustBright : C.feltBright }),
+      React.createElement(Stat, { label: "Fase mais fraca", value: phaseNames[weakestPhase] })
+    ),
+    React.createElement(SectionLabel, null, "Distribuição de lances"),
+    React.createElement("div", { style: { background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 20, marginBottom: 20 } },
+      rows.map(([key, label, color]) => React.createElement("div", { key, style: { display: "flex", justifyContent: "space-between", padding: "6px 0", fontSize: 13.5 } },
+        React.createElement("span", { style: { color: C.inkDim } }, label),
+        React.createElement("span", { style: { color, fontWeight: 700 } }, counts[key])
+      ))
+    ),
+    React.createElement(SectionLabel, null, "Erro por fase"),
+    React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 12, background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 20, marginBottom: 20 } },
+      Object.entries(phaseErr).map(([key, v]) => React.createElement("div", { key },
+        React.createElement("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 6 } },
+          React.createElement("span", { style: { color: key === weakestPhase ? C.rustBright : C.inkDim, fontWeight: key === weakestPhase ? 700 : 400 } }, phaseNames[key]),
+          React.createElement("span", { style: { color: C.inkFaint } }, `${(v * 100).toFixed(1)}%`)
+        ),
+        React.createElement(Bar, { pct: v * 4, tone: key === weakestPhase ? "bad" : "neutral" })
+      ))
+    ),
+    React.createElement(SectionLabel, null, "Nota de análise"),
+    React.createElement("p", { style: { color: C.inkDim, fontSize: 13.5, lineHeight: 1.6, background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 16 } }, game.engineNote)
+  );
+}
+
+function App() {
+  const [games, setGames] = useState(loadGames());
+  const [tab, setTab] = useState("dashboard");
+  const [pgnInput, setPgnInput] = useState("");
+  const [source, setSource] = useState("chessis");
+  const [engineMode, setEngineMode] = useState("none");
+  const [selectedGameId, setSelectedGameId] = useState(null);
+  const [addStatus, setAddStatus] = useState(null);
+  const [analyzing, setAnalyzing] = useState(false);
+
+  const persist = useCallback((next) => { setGames(next); saveGames(next); }, []);
+
+  const handleAddGame = async () => {
+    if (!pgnInput.trim()) { setAddStatus({ ok: false, msg: "Cole um PGN antes de adicionar." }); return; }
+    setAnalyzing(true); setAddStatus(null);
+    try {
+      const parsed = parsePGN(pgnInput);
+      if (parsed.moves.length === 0) {
+        setAddStatus({ ok: false, msg: "Não consegui identificar lances nesse PGN. Verifique o formato." });
+        setAnalyzing(false); return;
+      }
+      let engineNote = "Classificação baseada nas anotações (!!/!/?!/?/??) presentes no PGN.";
+      if (engineMode === "lichess-cloud") {
+        const r = await analyzeWithLichessCloud(pgnInput);
+        engineNote = r.ok ? `Importado ao Lichess para análise: ${r.url}` : "Análise via Lichess indisponível agora — usando anotações do PGN como fallback.";
+      } else if (engineMode === "stockfish-js") {
+        engineNote = "Stockfish.js não está incluído nesta build — usando anotações do PGN como fallback.";
+      }
+      const kpis = computeGameKPIs({ parsed });
+      const newGame = { id: `g_${Date.now()}`, source, engineMode, engineNote, addedAt: new Date().toISOString(), parsed, kpis };
+      const next = [...games, newGame];
+      persist(next);
+      setPgnInput("");
+      setAddStatus({ ok: true, msg: "Partida adicionada e analisada." });
+      setTab("dashboard");
+    } catch (e) {
+      setAddStatus({ ok: false, msg: "Erro ao processar o PGN: " + e.message });
+    }
+    setAnalyzing(false);
+  };
+
+  const handleDeleteGame = (id) => {
+    const next = games.filter((g) => g.id !== id);
+    persist(next);
+    if (selectedGameId === id) setSelectedGameId(null);
+  };
+
+  const handleExport = () => {
+    const blob = new Blob([JSON.stringify(games, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `painel-tatico-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImport = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const imported = JSON.parse(ev.target.result);
+        if (!Array.isArray(imported)) throw new Error("formato inválido");
+        const existingIds = new Set(games.map((g) => g.id));
+        const merged = [...games, ...imported.filter((g) => !existingIds.has(g.id))];
+        persist(merged);
+        setAddStatus({ ok: true, msg: `${imported.length} partida(s) importada(s).` });
+      } catch (err) {
+        setAddStatus({ ok: false, msg: "Arquivo de importação inválido." });
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const agg = useMemo(() => aggregateKPIs(games), [games]);
+  const last20 = useMemo(() => games.slice(-20), [games]);
+  const agg20 = useMemo(() => aggregateKPIs(last20), [last20]);
+  const tips = useMemo(() => generateTips(agg20 || agg, last20.length ? last20 : games), [agg20, agg, last20, games]);
+  const selectedGame = games.find((g) => g.id === selectedGameId);
+
+  return React.createElement("div", { style: { minHeight: "100vh", background: C.bg, color: C.ink, fontFamily: "-apple-system, sans-serif", paddingBottom: 60 } },
+    React.createElement("div", { style: { borderBottom: `1px solid ${C.line}`, padding: "28px 20px 20px" } },
+      React.createElement("div", { style: { maxWidth: 880, margin: "0 auto" } },
+        React.createElement("div", { style: { display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" } },
+          React.createElement("span", { style: { fontFamily: "Georgia, serif", fontSize: 26, letterSpacing: "-0.01em" } }, "Painel Tático"),
+          React.createElement("span", { style: { color: C.brassDim, fontSize: 13 } }, "KPIs de xadrez, não estatística vazia")
+        ),
+        React.createElement("div", { style: { display: "flex", gap: 6, marginTop: 18, flexWrap: "wrap" } },
+          [["dashboard", "Visão geral"], ["add", "Adicionar partida"], ["history", "Histórico"]].map(([key, label]) =>
+            React.createElement("button", {
+              key, onClick: () => setTab(key),
+              style: { background: tab === key ? C.brass : "transparent", color: tab === key ? C.bg : C.inkDim, border: `1px solid ${tab === key ? C.brass : C.line}`, borderRadius: 6, padding: "7px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer" }
+            }, label)
+          ),
+          React.createElement("button", { onClick: handleExport, style: { background: "transparent", color: C.inkDim, border: `1px solid ${C.line}`, borderRadius: 6, padding: "7px 14px", fontSize: 13, cursor: "pointer" } }, "Exportar backup"),
+          React.createElement("label", { style: { background: "transparent", color: C.inkDim, border: `1px solid ${C.line}`, borderRadius: 6, padding: "7px 14px", fontSize: 13, cursor: "pointer" } },
+            "Importar",
+            React.createElement("input", { type: "file", accept: ".json", onChange: handleImport, style: { display: "none" } })
+          )
+        )
+      )
+    ),
+    React.createElement("div", { style: { maxWidth: 880, margin: "0 auto", padding: "24px 20px" } },
+      tab === "add" ? React.createElement(AddGameView, { pgnInput, setPgnInput, source, setSource, engineMode, setEngineMode, onAdd: handleAddGame, analyzing, status: addStatus })
+      : tab === "history" ? React.createElement(HistoryView, { games, onSelect: (id) => { setSelectedGameId(id); setTab("game"); }, onDelete: handleDeleteGame })
+      : tab === "game" && selectedGame ? React.createElement(GameDetailView, { game: selectedGame, onBack: () => setTab("history") })
+      : React.createElement(DashboardView, { games, agg, agg20, last20, tips, onGoAdd: () => setTab("add"), onGoHistory: () => setTab("history"), onSelectGame: (id) => { setSelectedGameId(id); setTab("game"); } })
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
