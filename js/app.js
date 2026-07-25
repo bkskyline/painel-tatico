@@ -149,15 +149,23 @@ function extractLichessEvals(pgnWithEvals) {
 // by centipawn loss — same bucket vocabulary as the local Stockfish path.
 async function analyzeWithLichessCloud(pgn, side, onProgress) {
   try {
+    console.log("Lichess: importing PGN via proxy...");
     const importRes = await lichessFetch("https://lichess.org/api/import", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: "pgn=" + encodeURIComponent(pgn),
     });
-    if (!importRes.ok) return { ok: false, reason: "import_failed" };
+    if (!importRes.ok) {
+      console.error("Lichess: import request failed, status", importRes.status);
+      return { ok: false, reason: "import_failed" };
+    }
     const data = await importRes.json();
+    console.log("Lichess: import response", data);
     const gameId = data.id;
-    if (!gameId) return { ok: false, reason: "no_id" };
+    if (!gameId) {
+      console.error("Lichess: import response had no game id", data);
+      return { ok: false, reason: "no_id" };
+    }
 
     // Lichess analyses asynchronously after import. Poll the analysed PGN export a few times.
     const maxAttempts = 8;
@@ -165,21 +173,32 @@ async function analyzeWithLichessCloud(pgn, side, onProgress) {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       onProgress && onProgress(attempt + 1, maxAttempts);
       await new Promise((r) => setTimeout(r, 2500));
+      console.log(`Lichess: polling export, attempt ${attempt + 1}/${maxAttempts}...`);
       const exportRes = await lichessFetch(`https://lichess.org/game/export/${gameId}?evals=1&clocks=0`, {
         headers: { Accept: "application/x-chess-pgn" },
       });
-      if (!exportRes.ok) continue;
+      if (!exportRes.ok) {
+        console.warn("Lichess: export request failed, status", exportRes.status);
+        continue;
+      }
       const text = await exportRes.text();
-      if (text.includes("%eval")) { pgnWithEvals = text; break; }
+      const hasEval = text.includes("%eval");
+      console.log(`Lichess: export attempt ${attempt + 1} — has %eval: ${hasEval}, length: ${text.length}`);
+      if (hasEval) { pgnWithEvals = text; break; }
     }
 
     if (!pgnWithEvals) {
+      console.warn("Lichess: analysis not ready after all attempts.");
       return { ok: false, reason: "analysis_not_ready", url: data.url };
     }
 
     const evals = extractLichessEvals(pgnWithEvals);
     const plies = buildPlyList(pgn);
-    if (!plies || evals.length === 0) return { ok: false, reason: "parse_failed", url: data.url };
+    console.log(`Lichess: extracted ${evals.length} evals, ${plies ? plies.length : 0} plies`);
+    if (!plies || evals.length === 0) {
+      console.error("Lichess: failed to build ply list or extract evals from analysed PGN.");
+      return { ok: false, reason: "parse_failed", url: data.url };
+    }
 
     // evals[i] is the position AFTER ply i was played, from White's perspective.
     const counts = { genius: 0, best: 0, good: 0, inaccuracy: 0, mistake: 0, blunder: 0 };
@@ -197,8 +216,10 @@ async function analyzeWithLichessCloud(pgn, side, onProgress) {
       moveResults.push({ san: ply.san, cpLoss, bucket });
     }
 
+    console.log("Lichess: final counts", counts);
     return { ok: true, counts, moveResults, url: data.url };
   } catch (e) {
+    console.error("Lichess: uncaught error in analysis flow:", e);
     return { ok: false, reason: "network" };
   }
 }
@@ -217,7 +238,17 @@ function getStockfishWorker() {
       // ~7MB, runs without special CORS/COEP headers. Pinned to 18.0.0 rather than "latest"
       // so the filename contract doesn't shift under us again.
       const workerUrl = "https://cdn.jsdelivr.net/npm/stockfish@18.0.0/src/stockfish-18-lite-single.js";
-      const worker = new Worker(workerUrl);
+
+      // Browsers block `new Worker(crossOriginUrl)` directly (same-origin policy on Worker
+      // construction). The standard workaround: create the worker from a same-origin Blob
+      // whose only content is `importScripts(absoluteUrl)` — importScripts() is allowed to
+      // load cross-origin scripts from inside a worker context, and the Stockfish script's
+      // own internal fetch of its companion .wasm file resolves against that original CDN
+      // URL correctly (not against the blob: URL).
+      const bootstrap = `importScripts(${JSON.stringify(workerUrl)});`;
+      const blob = new Blob([bootstrap], { type: "application/javascript" });
+      const blobUrl = URL.createObjectURL(blob);
+      const worker = new Worker(blobUrl);
       let handshakeDone = false;
 
       worker.addEventListener("error", (err) => {
