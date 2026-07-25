@@ -1,4 +1,4 @@
-const CACHE_NAME = "painel-tatico-v1";
+const CACHE_NAME = "painel-tatico-v2";
 const ASSETS = [
   "./",
   "./index.html",
@@ -26,8 +26,8 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const req = event.request;
-  // Network-first for CDN scripts (React etc.), cache-first for local assets
-  if (req.url.includes("unpkg.com")) {
+  // Network-first for CDN scripts (React, chess.js, Stockfish), cache-first for local assets
+  if (req.url.includes("unpkg.com") || req.url.includes("jsdelivr.net") || req.url.includes("cdnjs.cloudflare.com")) {
     event.respondWith(
       fetch(req).then((res) => {
         const resClone = res.clone();
