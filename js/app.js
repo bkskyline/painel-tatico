@@ -115,16 +115,19 @@ function saveSettings(settings) {
 }
 
 // ---------- Engine adapters ----------
-// Public CORS proxy — routes the browser's request through a third-party relay so the
-// Lichess API (which doesn't allow direct cross-origin calls) can be reached from a static
-// site with no backend of its own. This is a convenience for testing: it depends on a free
-// third-party service staying up and correctly passing through POST bodies, and isn't
-// something to rely on long-term. If this proxy starts failing, swap the constant below.
-const CORS_PROXY = "https://corsproxy.io/?url=";
+// Dedicated proxy: a Cloudflare Worker deployed by the user specifically to relay
+// Lichess API calls with proper CORS headers. Replaces the public third-party proxy
+// (corsproxy.io), which repeatedly failed under load by returning HTML error pages
+// instead of the real response. This Worker only talks to lichess.org, so it's not
+// subject to the rate-limiting/instability of a shared public proxy.
+const LICHESS_WORKER_BASE = "https://painel-tatico-lichess-proxy.br-bkskyline.workers.dev";
 
-async function lichessFetch(url, options) {
-  const res = await fetch(CORS_PROXY + encodeURIComponent(url), options);
-  return res;
+async function lichessFetch(lichessUrl, options) {
+  // lichessUrl looks like "https://lichess.org/api/import" — the worker expects the
+  // same path under /lichess/, e.g. "https://<worker>/lichess/api/import".
+  const path = lichessUrl.replace("https://lichess.org", "");
+  const proxiedUrl = LICHESS_WORKER_BASE + "/lichess" + path;
+  return fetch(proxiedUrl, options);
 }
 
 // Guards against proxies that fail "successfully" — returning HTTP 200 with an HTML error
@@ -680,7 +683,7 @@ function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, set
         React.createElement("label", { style: labelStyle }, "Modo de análise"),
         React.createElement("select", { value: engineMode, onChange: (e) => setEngineMode(e.target.value), style: selectStyle },
           React.createElement("option", { value: "none" }, "Sem engine (usa anotações do PGN)"),
-          React.createElement("option", { value: "lichess-cloud" }, "API do Lichess (via proxy)"),
+          React.createElement("option", { value: "lichess-cloud" }, "API do Lichess (proxy próprio)"),
           React.createElement("option", { value: "stockfish-js" }, "Stockfish.js no navegador")
         )
       )
@@ -699,7 +702,7 @@ function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, set
       style: { background: analyzing ? C.brassDim : C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "12px 24px", fontWeight: 700, fontSize: 14, cursor: analyzing ? "default" : "pointer", width: "100%" }
     }, analyzing ? "Analisando…" : "Adicionar e analisar"),
     React.createElement("p", { style: { fontSize: 12, color: C.inkFaint, marginTop: 12, lineHeight: 1.6 } },
-      "Nota sobre engines: o modo \"sem engine\" usa as anotações (!!, !, ?!, ?, ??) já presentes no PGN — rápido, mas só funciona se a fonte já anotou (Chessis faz isso; PGN cru do Chess.com/Lichess geralmente não). O modo Stockfish.js roda análise real, local no navegador — mais lento, mas funciona em qualquer PGN. O modo Lichess cloud importa a partida e busca a análise deles via um proxy público (corsproxy.io) para contornar bloqueio de navegador — pode levar até ~20s e depende desse serviço de terceiro estar no ar; se falhar, tenta de novo em instantes."
+      "Nota sobre engines: o modo \"sem engine\" usa as anotações (!!, !, ?!, ?, ??) já presentes no PGN — rápido, mas só funciona se a fonte já anotou (Chessis faz isso; PGN cru do Chess.com/Lichess geralmente não). O modo Stockfish.js roda análise real, local no navegador — mais lento, mas funciona em qualquer PGN. O modo Lichess cloud importa a partida e busca a análise deles através de um proxy dedicado (Cloudflare Worker próprio) — pode levar até ~20s."
     )
   );
 }
@@ -874,11 +877,11 @@ function App() {
       setAnalyzeProgress(null);
       if (r.ok) {
         externalCounts = r.counts;
-        engineNote = `Analisado pelo motor do Lichess (via proxy CORS). Partida importada: ${r.url}`;
+        engineNote = `Analisado pelo motor do Lichess (via proxy dedicado no Cloudflare). Partida importada: ${r.url}`;
       } else if (r.reason === "analysis_not_ready") {
         engineNote = `Lichess ainda não terminou de analisar essa partida — tente de novo em ~1 min, ou veja em: ${r.url}. Usando anotações do PGN como fallback por enquanto.`;
       } else if (r.reason === "proxy_html_response") {
-        engineNote = "O proxy CORS gratuito usado para acessar o Lichess está fora do ar ou bloqueando agora — isso é uma limitação conhecida de depender de um serviço de terceiro grátis. Recomendo usar o modo Stockfish.js, que roda local e não depende de proxy. Usando anotações do PGN como fallback por enquanto.";
+        engineNote = "O proxy dedicado (Cloudflare Worker) não respondeu corretamente agora — pode ser instabilidade momentânea do worker ou do próprio Lichess. Usando anotações do PGN como fallback por enquanto; tente de novo em instantes.";
       } else {
         engineNote = "Análise via Lichess indisponível agora (proxy ou rede) — usando anotações do PGN como fallback.";
       }
