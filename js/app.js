@@ -136,6 +136,7 @@ async function lichessFetch(lichessUrl, options) {
 async function assertJsonResponse(res) {
   const text = await res.text();
   const trimmed = text.trim();
+  console.log("Lichess: raw response body (first 500 chars):", trimmed.slice(0, 500));
   if (trimmed.startsWith("<")) {
     throw new Error("Proxy returned an HTML page instead of JSON — the CORS proxy is likely down or rate-limiting.");
   }
