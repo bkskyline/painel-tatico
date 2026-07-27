@@ -33,6 +33,24 @@ function parsePGN(pgn) {
   return { tags, moves: moveTokens, raw: pgn };
 }
 
+// Splits a multi-game PGN file (e.g. Chessis' "export selected games" output) into an
+// array of individual single-game PGN strings. Standard PGN convention: each game starts
+// with a block of [Tag "value"] headers, the first of which is typically [Event ...]. We
+// split on the boundary right before each "[Event " that isn't at the very start of the
+// file — this is more robust than splitting on blank lines, since some exporters vary
+// blank-line placement but Event tags reliably open every game.
+function splitMultiGamePgn(text) {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  // Find every position where a new game's tag block begins.
+  const eventTagRegex = /(?=^\s*\[Event\s+")/gm;
+  const parts = trimmed.split(eventTagRegex).map((p) => p.trim()).filter(Boolean);
+  if (parts.length > 0) return parts;
+  // Fallback: no [Event tags found at all (unusual, but some minimal exports omit tags
+  // entirely) — treat the whole file as one game rather than silently dropping it.
+  return [trimmed];
+}
+
 function classifyMoves(moves) {
   const counts = { genius: 0, best: 0, good: 0, inaccuracy: 0, mistake: 0, blunder: 0 };
   moves.forEach((mv) => {
@@ -724,7 +742,7 @@ function DashboardView({ games, agg, agg20, last20, tips, onGoAdd, onGoHistory, 
   );
 }
 
-function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, setEngineMode, onAdd, analyzing, status }) {
+function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, setEngineMode, onAdd, analyzing, status, onImportPgnFile, batchImportStatus }) {
   const labelStyle = { fontSize: 12, letterSpacing: "0.05em", textTransform: "uppercase", color: C.inkFaint, marginBottom: 8, display: "block", fontWeight: 600 };
   const selectStyle = { width: "100%", background: C.bgPanel2, border: `1px solid ${C.line}`, borderRadius: 6, color: C.ink, padding: "10px 12px", fontSize: 14 };
   return React.createElement("div", { style: { maxWidth: 640, margin: "0 auto" } },
@@ -762,8 +780,31 @@ function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, set
       onClick: onAdd, disabled: analyzing,
       style: { background: analyzing ? C.brassDim : C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "12px 24px", fontWeight: 700, fontSize: 14, cursor: analyzing ? "default" : "pointer", width: "100%" }
     }, analyzing ? "Analisando…" : "Adicionar e analisar"),
-    React.createElement("p", { style: { fontSize: 12, color: C.inkFaint, marginTop: 12, lineHeight: 1.6 } },
+    React.createElement("p", { style: { fontSize: 12, color: C.inkFaint, marginTop: 12, marginBottom: 28, lineHeight: 1.6 } },
       "Nota sobre engines: o modo \"sem engine\" usa as anotações (!!, !, ?!, ?, ??) já presentes no PGN — rápido, mas só funciona se a fonte já anotou (Chessis faz isso; PGN cru do Chess.com/Lichess geralmente não). O modo Stockfish.js roda análise real, local no navegador — mais lento, mas totalmente automático. O modo Lichess é semi-manual: a API do Lichess não tem como acionar a análise sozinha, então depois de importar a partida, você mesmo abre o link, clica em \"Request a computer analysis\" no site, espera terminar, e volta aqui para buscar o resultado."
+    ),
+
+    React.createElement("div", { style: { borderTop: `1px solid ${C.line}`, paddingTop: 24 } },
+      React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 18, marginBottom: 4 } }, "Ou envie um arquivo .pgn com várias partidas"),
+      React.createElement("p", { style: { color: C.inkDim, fontSize: 13.5, marginBottom: 16, lineHeight: 1.6 } },
+        "Use isto para o export do Chessis quando você seleciona várias partidas de uma vez — o arquivo baixado contém todas juntas, e este envio separa e adiciona cada uma automaticamente. Usa o modo de análise escolhido acima (o modo Lichess semi-manual não está disponível aqui, já que exige um clique manual por partida — use o modo Stockfish.js ou sem engine para lotes)."
+      ),
+      batchImportStatus && React.createElement("div", {
+        style: { padding: "10px 14px", borderRadius: 6, marginBottom: 14, fontSize: 13, background: "rgba(201,162,75,0.12)", color: C.brass }
+      }, `Processando partida ${batchImportStatus.current}/${batchImportStatus.total}… (${batchImportStatus.added} adicionada(s), ${batchImportStatus.skipped} pulada(s) até agora)`),
+      React.createElement("label", {
+        style: {
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+          background: "transparent", border: `1px dashed ${C.brassDim}`, borderRadius: 8,
+          color: C.brass, padding: "16px", fontSize: 13.5, fontWeight: 600, cursor: batchImportStatus ? "default" : "pointer",
+          opacity: batchImportStatus ? 0.6 : 1,
+        }
+      },
+        batchImportStatus ? "Processando…" : "Escolher arquivo .pgn",
+        React.createElement("input", {
+          type: "file", accept: ".pgn,.txt", onChange: onImportPgnFile, disabled: !!batchImportStatus, style: { display: "none" }
+        })
+      )
     )
   );
 }
@@ -1096,6 +1137,85 @@ function App() {
     URL.revokeObjectURL(url);
   };
 
+  const [batchImportStatus, setBatchImportStatus] = useState(null);
+
+  const handleImportPgnFile = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    e.target.value = "";
+
+    const text = await file.text();
+    const gamePgns = splitMultiGamePgn(text);
+    if (gamePgns.length === 0) {
+      setAddStatus({ ok: false, msg: "Não encontrei nenhuma partida nesse arquivo." });
+      return;
+    }
+
+    setBatchImportStatus({ current: 0, total: gamePgns.length, skipped: 0, added: 0 });
+
+    let added = 0;
+    let skipped = 0;
+    const skippedReasons = [];
+
+    for (let i = 0; i < gamePgns.length; i++) {
+      setBatchImportStatus({ current: i + 1, total: gamePgns.length, skipped, added });
+      const pgnText = gamePgns[i];
+      const parsed = parsePGN(pgnText);
+      if (parsed.moves.length === 0) {
+        skipped++;
+        skippedReasons.push(`Partida ${i + 1}: não consegui identificar lances.`);
+        continue;
+      }
+      const side = detectUserSide(parsed.tags, settings.usernames);
+      if (side === "unknown") {
+        // Batch mode doesn't stop to ask per-game — that would defeat the point of bulk
+        // import. Games with an unresolvable side are skipped and reported at the end;
+        // the person can add those individually via the normal single-PGN flow where the
+        // side-choice modal is available.
+        skipped++;
+        skippedReasons.push(`Partida ${i + 1} (${parsed.tags.White || "?"} vs ${parsed.tags.Black || "?"}): não consegui identificar qual lado é você — adicione manualmente.`);
+        continue;
+      }
+
+      // Batch mode only supports "sem engine" or Stockfish.js — the Lichess semi-manual
+      // flow requires a manual click per game on lichess.org, which doesn't fit a bulk
+      // import of potentially dozens of games.
+      let engineNote = "Classificação baseada nas anotações (!!/!/?!/?/??) presentes no PGN.";
+      let externalCounts = null;
+      let externalMoveResults = null;
+      if (engineMode === "stockfish-js") {
+        const r = await analyzeWithStockfish(pgnText, side, () => {});
+        if (r.ok) {
+          externalCounts = r.counts;
+          externalMoveResults = r.moveResults;
+          engineNote = "Analisado com Stockfish.js local, lance a lance, no seu navegador.";
+        } else {
+          engineNote = "Stockfish.js indisponível — usando anotações do PGN como fallback.";
+        }
+      }
+
+      const kpis = computeGameKPIs({ parsed }, side, externalCounts, externalMoveResults);
+      const newGame = {
+        id: `g_${Date.now()}_${i}`, source, engineMode: engineMode === "lichess-cloud" ? "none" : engineMode,
+        engineNote, resolvedSide: side, addedAt: new Date().toISOString(), parsed, kpis,
+      };
+      setGames((prev) => {
+        const next = [...prev, newGame];
+        saveGames(next);
+        return next;
+      });
+      added++;
+    }
+
+    setBatchImportStatus(null);
+    const summary = `${added} partida(s) adicionada(s)${skipped > 0 ? `, ${skipped} pulada(s)` : ""}.`;
+    setAddStatus({
+      ok: added > 0,
+      msg: skipped > 0 ? `${summary} ${skippedReasons.join(" ")}` : summary,
+    });
+    if (added > 0) setTab("dashboard");
+  };
+
   const handleImport = (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -1159,7 +1279,7 @@ function App() {
       style: { position: "fixed", bottom: 16, left: "50%", transform: "translateX(-50%)", background: C.bgPanel2, border: `1px solid ${C.brassDim}`, borderRadius: 8, padding: "10px 18px", fontSize: 13, color: C.brass, zIndex: 9998 }
     }, `Analisando com Stockfish… lance ${analyzeProgress.current}/${analyzeProgress.total}`),
     React.createElement("div", { style: { maxWidth: 880, margin: "0 auto", padding: "24px 20px" } },
-      tab === "add" ? React.createElement(AddGameView, { pgnInput, setPgnInput, source, setSource, engineMode, setEngineMode, onAdd: handleAddGame, analyzing, status: addStatus })
+      tab === "add" ? React.createElement(AddGameView, { pgnInput, setPgnInput, source, setSource, engineMode, setEngineMode, onAdd: handleAddGame, analyzing, status: addStatus, onImportPgnFile: handleImportPgnFile, batchImportStatus })
       : tab === "settings" ? React.createElement(SettingsView, { settings, onSave: persistSettings })
       : tab === "history" ? React.createElement(HistoryView, { games, onSelect: (id) => { setSelectedGameId(id); setTab("game"); }, onDelete: handleDeleteGame })
       : tab === "game" && selectedGame ? React.createElement(GameDetailView, { game: selectedGame, onBack: () => setTab("history") })
