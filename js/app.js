@@ -217,10 +217,18 @@ async function importToLichess(pgn) {
 // (hopefully) already been analysed by the person clicking "Request a computer analysis"
 // on lichess.org. Single attempt, no polling loop — if it's not ready yet, the person
 // just waits a bit longer and tries this step again.
+//
+// Uses ?literate=1 rather than ?evals=1: the literate export embeds Lichess's own
+// !!/!/?!/?/?? judgment glyphs directly onto each move's SAN (e.g. "10. Bg5?!"), which is
+// the exact same verdict shown in their UI. Recomputing a verdict from raw centipawn
+// deltas (the evals=1 approach previously used here) requires guessing Lichess's internal
+// thresholds and win-probability dampening curve — small mismatches near a threshold
+// boundary then disagree with their UI even when the underlying eval numbers are right.
+// Reading their own glyphs sidesteps that entirely and guarantees an exact match.
 async function fetchLichessAnalysis(gameId, pgn, side) {
   try {
-    console.log("Lichess: fetching analysed PGN for", gameId);
-    const exportRes = await lichessFetch(`https://lichess.org/game/export/${gameId}?evals=1&clocks=0`, {
+    console.log("Lichess: fetching literate (annotated) PGN for", gameId);
+    const exportRes = await lichessFetch(`https://lichess.org/game/export/${gameId}?literate=1&clocks=0`, {
       headers: { Accept: "application/x-chess-pgn" },
     });
     if (!exportRes.ok) {
@@ -228,42 +236,44 @@ async function fetchLichessAnalysis(gameId, pgn, side) {
       return { ok: false, reason: "export_failed" };
     }
     const text = await exportRes.text();
-    const hasEval = text.includes("%eval");
-    console.log(`Lichess: export — has %eval: ${hasEval}, length: ${text.length}`);
-    if (!hasEval) {
+    // Literate export includes judgment glyphs glued to the SAN once analysis is ready;
+    // before that, moves have no ?!/?/??/!/!! suffix at all.
+    const hasJudgment = /[!?]{1,2}\s/.test(text) || /[!?]{1,2}\{/.test(text);
+    console.log(`Lichess: export — has judgment glyphs: ${hasJudgment}, length: ${text.length}`);
+    if (!hasJudgment) {
       return { ok: false, reason: "analysis_not_ready" };
     }
 
-    const evals = extractLichessEvals(text);
-    const plies = buildPlyList(pgn);
-    console.log(`Lichess: extracted ${evals.length} evals, ${plies ? plies.length : 0} plies`);
-    if (!plies || evals.length === 0) {
-      console.error("Lichess: failed to build ply list or extract evals from analysed PGN.");
+    const parsedAnalysed = parsePGN(text);
+    const mine = userMoves(parsedAnalysed.moves, side);
+    if (mine.length === 0) {
+      console.error("Lichess: no moves found for the resolved side in the literate PGN.");
       return { ok: false, reason: "parse_failed" };
     }
 
-    // evals[i] is the position AFTER ply i was played, from White's perspective.
-    const counts = { genius: 0, best: 0, good: 0, inaccuracy: 0, mistake: 0, blunder: 0 };
-    const moveResults = [];
-    for (let i = 0; i < plies.length && i < evals.length; i++) {
-      const ply = plies[i];
-      const userSideChar = side === "white" ? "white" : side === "black" ? "black" : null;
-      if (userSideChar && ply.side !== userSideChar) continue;
-      const before = i === 0 ? 0 : evals[i - 1];
-      const after = evals[i];
-      const sign = ply.side === "white" ? 1 : -1;
-      const cpLoss = (before * sign) - (after * sign);
-      const evalBeforeAbs = Math.abs(before);
-      const bucket = bucketFromCpLoss(cpLoss, evalBeforeAbs);
-      counts[bucket]++;
-      moveResults.push({ san: ply.san, cpLoss, bucket });
-    }
-    console.log("Lichess: final counts", counts);
+    // Reuse the exact same glyph classifier already used for Chessis-style PGNs — this
+    // guarantees byte-for-byte the same bucket vocabulary and logic across both paths.
+    const counts = classifyMoves(mine);
+    const moveResults = mine.map((san) => ({ san, cpLoss: null, bucket: glyphBucket(san) }));
+
+    console.log("Lichess: final counts (from Lichess's own glyphs)", counts);
     return { ok: true, counts, moveResults };
   } catch (e) {
-    console.error("Lichess: uncaught error during export fetch:", e);
+    console.error("Lichess: uncaught error during export/analysis:", e);
     return { ok: false, reason: "network" };
   }
+}
+
+// Maps a single annotated move token to the same bucket vocabulary used elsewhere,
+// mirroring classifyMoves()'s per-token logic so moveResults (used for phase breakdown)
+// stays consistent with counts (used for the overall totals).
+function glyphBucket(mv) {
+  if (/!!$/.test(mv)) return "genius";
+  if (/\?\?$/.test(mv)) return "blunder";
+  if (/\?!$/.test(mv)) return "inaccuracy";
+  if (/\?$/.test(mv)) return "mistake";
+  if (/!$/.test(mv)) return "best";
+  return "good";
 }
 
 // Stockfish worker singleton — created lazily on first use so pages that never touch
