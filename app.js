@@ -18,8 +18,37 @@ function parsePGN(pgn) {
   body = body.replace(/\$\d+/g, "");
   body = body.replace(/\([^()]*\)/g, "");
   body = body.replace(/(1-0|0-1|1\/2-1\/2|\*)\s*$/, "").trim();
-  const moveTokens = body.split(/\s+/).filter((t) => t && !/^\d+\.(\.\.)?$/.test(t) && !/^\d+\.$/.test(t));
+
+  // Move numbers are sometimes glued directly to the move with no space (e.g. "1.e4",
+  // "23.Nxd4" — this is Chess.com's and several other sites' default export format,
+  // not just an edge case). Strip any leading "<digits>.(...)? " prefix from each raw
+  // token BEFORE filtering, so a glued token like "1.e4" becomes "e4" instead of being
+  // left dirty (which would corrupt move text) or, if the old pure-number-token filter
+  // missed it, throw off the white/black ply alignment used everywhere downstream.
+  const rawTokens = body.split(/\s+/).filter(Boolean);
+  const moveTokens = rawTokens
+    .map((t) => t.replace(/^\d+\.(\.\.)?/, ""))
+    .filter((t) => t.length > 0);
+
   return { tags, moves: moveTokens, raw: pgn };
+}
+
+// Splits a multi-game PGN file (e.g. Chessis' "export selected games" output) into an
+// array of individual single-game PGN strings. Standard PGN convention: each game starts
+// with a block of [Tag "value"] headers, the first of which is typically [Event ...]. We
+// split on the boundary right before each "[Event " that isn't at the very start of the
+// file — this is more robust than splitting on blank lines, since some exporters vary
+// blank-line placement but Event tags reliably open every game.
+function splitMultiGamePgn(text) {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  // Find every position where a new game's tag block begins.
+  const eventTagRegex = /(?=^\s*\[Event\s+")/gm;
+  const parts = trimmed.split(eventTagRegex).map((p) => p.trim()).filter(Boolean);
+  if (parts.length > 0) return parts;
+  // Fallback: no [Event tags found at all (unusual, but some minimal exports omit tags
+  // entirely) — treat the whole file as one game rather than silently dropping it.
+  return [trimmed];
 }
 
 function classifyMoves(moves) {
@@ -35,15 +64,51 @@ function classifyMoves(moves) {
   return counts;
 }
 
-function detectResult(tags) {
+// Determines which side (white/black/unknown) the user played, given saved usernames.
+// Returns "unknown" when neither White nor Black tag matches "Você" or a known username —
+// in that case the caller should prompt the person to pick a side manually.
+function detectUserSide(tags, knownUsernames = []) {
+  const white = (tags.White || "").trim().toLowerCase();
+  const black = (tags.Black || "").trim().toLowerCase();
+  const isVoce = (s) => /voc[eê]/i.test(s);
+  const normalizedKnown = knownUsernames.map((u) => u.trim().toLowerCase()).filter(Boolean);
+
+  if (isVoce(white) && !isVoce(black)) return "white";
+  if (isVoce(black) && !isVoce(white)) return "black";
+  if (normalizedKnown.includes(white) && !normalizedKnown.includes(black)) return "white";
+  if (normalizedKnown.includes(black) && !normalizedKnown.includes(white)) return "black";
+  return "unknown";
+}
+
+// Splits the flat move list (White, Black, White, Black, ...) into each side's moves.
+function splitMovesBySide(moves) {
+  const white = [];
+  const black = [];
+  moves.forEach((mv, i) => {
+    if (i % 2 === 0) white.push(mv);
+    else black.push(mv);
+  });
+  return { white, black };
+}
+
+// Returns only the moves belonging to the user, given an explicit resolved side
+// ("white" | "black"). Falls back to all moves if side is "unknown" — callers should
+// avoid that case by resolving the side (auto-detect or manual pick) before calling.
+function userMoves(moves, side) {
+  const { white, black } = splitMovesBySide(moves);
+  if (side === "white") return white;
+  if (side === "black") return black;
+  return moves;
+}
+
+function detectResult(tags, resolvedSide) {
   const r = tags.Result || "*";
-  const userIsWhite = /voc[eê]/i.test(tags.White || "");
-  const userIsBlack = /voc[eê]/i.test(tags.Black || "");
+  const side = resolvedSide || detectUserSide(tags);
   let outcome = "desconhecido";
-  if (r === "1-0") outcome = userIsWhite ? "vitória" : userIsBlack ? "derrota" : "brancas venceram";
-  else if (r === "0-1") outcome = userIsBlack ? "vitória" : userIsWhite ? "derrota" : "pretas venceram";
+  if (r === "1-0") outcome = side === "white" ? "vitória" : side === "black" ? "derrota" : "brancas venceram";
+  else if (r === "0-1") outcome = side === "black" ? "vitória" : side === "white" ? "derrota" : "pretas venceram";
   else if (r === "1/2-1/2") outcome = "empate";
-  return { outcome, userColor: userIsWhite ? "white" : userIsBlack ? "black" : "unknown" };
+  return { outcome, userColor: side };
 }
 
 function openingFamily(ecoOrName) {
@@ -54,6 +119,8 @@ function openingFamily(ecoOrName) {
 
 // ---------- Storage (localStorage-backed) ----------
 const GAMES_KEY = "chesskpi:games";
+const SETTINGS_KEY = "chesskpi:settings";
+
 function loadGames() {
   try {
     const raw = localStorage.getItem(GAMES_KEY);
@@ -65,35 +132,392 @@ function saveGames(games) {
   catch (e) { console.error("localStorage set failed", e); }
 }
 
-// ---------- Engine adapters ----------
-async function analyzeWithLichessCloud(pgn) {
+function loadSettings() {
   try {
-    const importRes = await fetch("https://lichess.org/api/import", {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    return raw ? JSON.parse(raw) : { usernames: [] };
+  } catch { return { usernames: [] }; }
+}
+function saveSettings(settings) {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); }
+  catch (e) { console.error("localStorage set failed", e); }
+}
+
+// ---------- Engine adapters ----------
+// Dedicated proxy: a Cloudflare Worker deployed by the user specifically to relay
+// Lichess API calls with proper CORS headers. Replaces the public third-party proxy
+// (corsproxy.io), which repeatedly failed under load by returning HTML error pages
+// instead of the real response. This Worker only talks to lichess.org, so it's not
+// subject to the rate-limiting/instability of a shared public proxy.
+const LICHESS_WORKER_BASE = "https://painel-tatico-lichess-proxy.br-bkskyline.workers.dev";
+
+async function lichessFetch(lichessUrl, options) {
+  // lichessUrl looks like "https://lichess.org/api/import" — the worker expects the
+  // same path under /lichess/, e.g. "https://<worker>/lichess/api/import".
+  const path = lichessUrl.replace("https://lichess.org", "");
+  const proxiedUrl = LICHESS_WORKER_BASE + "/lichess" + path;
+  return fetch(proxiedUrl, options);
+}
+
+// Guards against proxies that fail "successfully" — returning HTTP 200 with an HTML error
+// page instead of the real JSON/PGN payload. Throws a clear error instead of letting
+// JSON.parse() fail later with a confusing "Unexpected token '<'" message.
+async function assertJsonResponse(res) {
+  const text = await res.text();
+  const trimmed = text.trim();
+  console.log("Lichess: raw response body (first 500 chars):", trimmed.slice(0, 500));
+  if (trimmed.startsWith("<")) {
+    throw new Error("Proxy returned an HTML page instead of JSON — the CORS proxy is likely down or rate-limiting.");
+  }
+  return JSON.parse(trimmed);
+}
+
+// Extracts [%eval ...] annotations from a Lichess-analysed PGN's movetext and returns them
+// as a flat array of centipawn scores (from White's perspective), one per ply, in game order.
+// Mate scores are converted to a large finite number preserving sign.
+function extractLichessEvals(pgnWithEvals) {
+  const evalRegex = /\[%eval\s+(#?-?\d+(?:\.\d+)?)\]/g;
+  const evals = [];
+  let m;
+  while ((m = evalRegex.exec(pgnWithEvals)) !== null) {
+    const raw = m[1];
+    if (raw.startsWith("#")) {
+      const mateIn = parseInt(raw.slice(1), 10);
+      evals.push(mateIn > 0 ? 10000 : -10000);
+    } else {
+      evals.push(Math.round(parseFloat(raw) * 100)); // pawns -> centipawns
+    }
+  }
+  return evals;
+}
+
+// Imports a PGN to Lichess (via CORS proxy), polls its export endpoint until the analysis
+// (%eval comments) is present or a timeout is hit, then classifies the user's own moves
+// by centipawn loss — same bucket vocabulary as the local Stockfish path.
+// Step 1 of the semi-manual Lichess flow: import the PGN and return its Lichess URL.
+// The Lichess API has no endpoint to trigger the "Request a computer analysis" action
+// programmatically — that's a website-only action (confirmed: no such route exists in
+// the public API docs). So after this import, the person needs to open the returned URL,
+// click "Request a computer analysis" themselves, wait for it to finish, then come back
+// and use fetchLichessAnalysis() to pull the now-ready evals.
+async function importToLichess(pgn) {
+  try {
+    console.log("Lichess: importing PGN via proxy...");
+    const importRes = await lichessFetch("https://lichess.org/api/import", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: "pgn=" + encodeURIComponent(pgn),
     });
-    if (!importRes.ok) return { ok: false, reason: "import_failed" };
-    const data = await importRes.json();
-    return { ok: true, url: data.url, id: data.id };
-  } catch (e) { return { ok: false, reason: "network" }; }
+    if (!importRes.ok) {
+      console.error("Lichess: import request failed, status", importRes.status);
+      return { ok: false, reason: "import_failed" };
+    }
+    let data;
+    try {
+      data = await assertJsonResponse(importRes);
+    } catch (parseErr) {
+      console.error("Lichess: import response was not valid JSON.", parseErr.message);
+      return { ok: false, reason: "proxy_html_response" };
+    }
+    console.log("Lichess: import response", data);
+    if (!data.id) {
+      console.error("Lichess: import response had no game id", data);
+      return { ok: false, reason: "no_id" };
+    }
+    return { ok: true, id: data.id, url: data.url };
+  } catch (e) {
+    console.error("Lichess: uncaught error during import:", e);
+    return { ok: false, reason: "network" };
+  }
+}
+
+// Step 2 of the semi-manual Lichess flow: fetch the analysed PGN for a game that has
+// (hopefully) already been analysed by the person clicking "Request a computer analysis"
+// on lichess.org. Single attempt, no polling loop — if it's not ready yet, the person
+// just waits a bit longer and tries this step again.
+//
+// Uses ?literate=1 rather than ?evals=1: the literate export embeds Lichess's own
+// !!/!/?!/?/?? judgment glyphs directly onto each move's SAN (e.g. "10. Bg5?!"), which is
+// the exact same verdict shown in their UI. Recomputing a verdict from raw centipawn
+// deltas (the evals=1 approach previously used here) requires guessing Lichess's internal
+// thresholds and win-probability dampening curve — small mismatches near a threshold
+// boundary then disagree with their UI even when the underlying eval numbers are right.
+// Reading their own glyphs sidesteps that entirely and guarantees an exact match.
+async function fetchLichessAnalysis(gameId, pgn, side) {
+  try {
+    console.log("Lichess: fetching literate (annotated) PGN for", gameId);
+    const exportRes = await lichessFetch(`https://lichess.org/game/export/${gameId}?literate=1&clocks=0`, {
+      headers: { Accept: "application/x-chess-pgn" },
+    });
+    if (!exportRes.ok) {
+      console.error("Lichess: export request failed, status", exportRes.status);
+      return { ok: false, reason: "export_failed" };
+    }
+    const text = await exportRes.text();
+    // Literate export includes judgment glyphs glued to the SAN once analysis is ready;
+    // before that, moves have no ?!/?/??/!/!! suffix at all.
+    const hasJudgment = /[!?]{1,2}\s/.test(text) || /[!?]{1,2}\{/.test(text);
+    console.log(`Lichess: export — has judgment glyphs: ${hasJudgment}, length: ${text.length}`);
+    if (!hasJudgment) {
+      return { ok: false, reason: "analysis_not_ready" };
+    }
+
+    const parsedAnalysed = parsePGN(text);
+    const mine = userMoves(parsedAnalysed.moves, side);
+    if (mine.length === 0) {
+      console.error("Lichess: no moves found for the resolved side in the literate PGN.");
+      return { ok: false, reason: "parse_failed" };
+    }
+
+    // Reuse the exact same glyph classifier already used for Chessis-style PGNs — this
+    // guarantees byte-for-byte the same bucket vocabulary and logic across both paths.
+    const counts = classifyMoves(mine);
+    const moveResults = mine.map((san) => ({ san, cpLoss: null, bucket: glyphBucket(san) }));
+
+    console.log("Lichess: final counts (from Lichess's own glyphs)", counts);
+    return { ok: true, counts, moveResults };
+  } catch (e) {
+    console.error("Lichess: uncaught error during export/analysis:", e);
+    return { ok: false, reason: "network" };
+  }
+}
+
+// Maps a single annotated move token to the same bucket vocabulary used elsewhere,
+// mirroring classifyMoves()'s per-token logic so moveResults (used for phase breakdown)
+// stays consistent with counts (used for the overall totals).
+function glyphBucket(mv) {
+  if (/!!$/.test(mv)) return "genius";
+  if (/\?\?$/.test(mv)) return "blunder";
+  if (/\?!$/.test(mv)) return "inaccuracy";
+  if (/\?$/.test(mv)) return "mistake";
+  if (/!$/.test(mv)) return "best";
+  return "good";
+}
+
+// Stockfish worker singleton — created lazily on first use so pages that never touch
+// engine analysis don't pay the download/init cost.
+let _sfWorker = null;
+let _sfReady = null;
+
+function getStockfishWorker() {
+  if (_sfWorker) return _sfReady;
+  _sfReady = new Promise((resolve, reject) => {
+    try {
+      // Confirmed on npmjs.com/package/stockfish: version 18.x ships fixed (non-hashed)
+      // filenames — stockfish-18-lite-single.js is the lite single-threaded WASM build,
+      // ~7MB, runs without special CORS/COEP headers. Pinned to 18.0.0 rather than "latest"
+      // so the filename contract doesn't shift under us again.
+      const workerUrl = "https://unpkg.com/stockfish@18.0.0/src/stockfish-18-lite-single.js";
+
+      // Browsers block `new Worker(crossOriginUrl)` directly (same-origin policy on Worker
+      // construction). The standard workaround: create the worker from a same-origin Blob
+      // whose only content is `importScripts(absoluteUrl)` — importScripts() is allowed to
+      // load cross-origin scripts from inside a worker context, and the Stockfish script's
+      // own internal fetch of its companion .wasm file resolves against that original CDN
+      // URL correctly (not against the blob: URL).
+      const bootstrap = `importScripts(${JSON.stringify(workerUrl)});`;
+      const blob = new Blob([bootstrap], { type: "application/javascript" });
+      const blobUrl = URL.createObjectURL(blob);
+      const worker = new Worker(blobUrl);
+      let handshakeDone = false;
+
+      worker.addEventListener("error", (err) => {
+        console.error("Stockfish worker error (script load or runtime):", err.message || err, "URL:", workerUrl);
+        if (!handshakeDone) reject(err);
+      });
+
+      const onFirstMessage = (e) => {
+        if (String(e.data).includes("uciok") || String(e.data).includes("Stockfish")) {
+          handshakeDone = true;
+          console.log("Stockfish handshake OK:", e.data);
+          worker.removeEventListener("message", onFirstMessage);
+          resolve(worker);
+        }
+      };
+      worker.addEventListener("message", onFirstMessage);
+      worker.postMessage("uci");
+      _sfWorker = worker;
+      // Safety fallback: some builds respond with different handshake text than expected.
+      // If we haven't resolved by 4s, log it clearly instead of silently proceeding —
+      // this makes "engine loaded but never spoke" visible and distinguishable from
+      // "engine failed to load at all" (which fires the error listener above instead).
+      setTimeout(() => {
+        if (!handshakeDone) {
+          console.warn("Stockfish handshake timeout — proceeding anyway, but engine may not respond correctly.");
+          resolve(worker);
+        }
+      }, 4000);
+    } catch (err) {
+      reject(err);
+    }
+  });
+  return _sfReady;
+}
+
+// Evaluates a single FEN position with Stockfish, returns centipawn score from White's
+// perspective (positive = White better), or null on mate-in-N scores converted to a large number.
+function evalPositionWithWorker(worker, fen, depth = 10) {
+  return new Promise((resolve) => {
+    let resolved = false;
+    const onMessage = (e) => {
+      const line = typeof e.data === "string" ? e.data : "";
+      const mateMatch = line.match(/score mate (-?\d+)/);
+      const cpMatch = line.match(/score cp (-?\d+)/);
+      if (line.startsWith("bestmove")) {
+        if (!resolved) {
+          resolved = true;
+          worker.removeEventListener("message", onMessage);
+          resolve(lastScore);
+        }
+        return;
+      }
+      if (mateMatch) lastScore = (parseInt(mateMatch[1], 10) > 0 ? 1 : -1) * 10000;
+      else if (cpMatch) lastScore = parseInt(cpMatch[1], 10);
+    };
+    let lastScore = 0;
+    worker.addEventListener("message", onMessage);
+    worker.postMessage("position fen " + fen);
+    worker.postMessage("go depth " + depth);
+    // Safety timeout per position so one stuck eval doesn't hang the whole game analysis.
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        worker.removeEventListener("message", onMessage);
+        resolve(lastScore);
+      }
+    }, 3000);
+  });
+}
+
+// Replays a PGN through chess.js move-by-move, producing { san, fenBefore, fenAfter, side } per ply.
+// Requires the global `Chess` constructor from the chess.js CDN script.
+function buildPlyList(rawPgn) {
+  if (typeof Chess === "undefined") return null;
+  // chess.js 0.12.0 uses snake_case method names (load_pgn, not loadPgn as in later 1.x betas).
+  const chess = new Chess();
+  const loaded = chess.load_pgn ? chess.load_pgn(rawPgn) : false;
+  if (loaded === false) return null;
+  const history = chess.history({ verbose: true });
+  if (!history || history.length === 0) return null;
+
+  const replay = new Chess();
+  const plies = [];
+  history.forEach((mv) => {
+    const fenBefore = replay.fen();
+    replay.move({ from: mv.from, to: mv.to, promotion: mv.promotion });
+    const fenAfter = replay.fen();
+    plies.push({ san: mv.san, fenBefore, fenAfter, side: mv.color === "w" ? "white" : "black" });
+  });
+  return plies;
+}
+
+// Classifies centipawn loss into the same bucket vocabulary used elsewhere in the app.
+// Thresholds confirmed from Lichess's own open-source classification logic
+// (github.com/ornicar/lila, modules/analyse/src/main/Advice.scala):
+//   50-99cp  -> Imprecisão (inaccuracy)
+//   100-299cp -> Erro (mistake)
+//   300cp+    -> Erro grave (blunder)
+// Below 50cp is not flagged as an error at all — that's normal play, not "good" vs "best"
+// in a meaningfully different sense worth splitting hairs over here.
+function bucketFromCpLoss(cpLoss, evalBeforeAbs) {
+  // Lichess dampens judgment once a position is already crushing in either direction
+  // (roughly beyond +-8 pawns / 800cp): dropping from +9 to +6 is still totally winning,
+  // so it isn't flagged as a blunder even though the raw centipawn swing is large. Without
+  // this cap, endgame mop-up moves in a won position get misclassified as errors.
+  if (evalBeforeAbs !== undefined && evalBeforeAbs >= 800 && cpLoss < 600) {
+    return cpLoss <= 0 ? "best" : "good";
+  }
+  if (cpLoss >= 300) return "blunder";
+  if (cpLoss >= 100) return "mistake";
+  if (cpLoss >= 50) return "inaccuracy";
+  if (cpLoss <= -120) return "genius"; // move gained significant advantage vs engine expectation
+  if (cpLoss <= 0) return "best";
+  return "good";
+}
+
+// Runs a full local Stockfish analysis over a PGN, returning per-user-move classification
+// counts plus a flat array of { san, cpLoss, bucket } for the user's own moves only.
+// Progress callback receives (currentPly, totalPlies) for UI feedback.
+async function analyzeWithStockfish(rawPgn, side, onProgress) {
+  const plies = buildPlyList(rawPgn);
+  if (!plies) {
+    console.error("Stockfish analysis: buildPlyList failed — PGN could not be parsed by chess.js. Is `Chess` defined?", typeof Chess);
+    return { ok: false, reason: "parse_failed" };
+  }
+
+  let worker;
+  try {
+    worker = await getStockfishWorker();
+  } catch (e) {
+    console.error("Stockfish analysis: worker failed to initialize.", e);
+    return { ok: false, reason: "worker_failed" };
+  }
+
+  const results = [];
+  const userSideChar = side === "white" ? "white" : side === "black" ? "black" : null;
+
+  for (let i = 0; i < plies.length; i++) {
+    const ply = plies[i];
+    if (userSideChar && ply.side !== userSideChar) {
+      onProgress && onProgress(i + 1, plies.length);
+      continue;
+    }
+    const evalBefore = await evalPositionWithWorker(worker, ply.fenBefore, 10);
+    const evalAfter = await evalPositionWithWorker(worker, ply.fenAfter, 10);
+    // Normalize both evals to "how good for the side who just moved"
+    const sign = ply.side === "white" ? 1 : -1;
+    const before = evalBefore * sign;
+    const after = -evalAfter * sign; // after the move, eval is reported from other side's turn
+    const cpLoss = before - after;
+    const evalBeforeAbs = Math.abs(before);
+    results.push({ san: ply.san, cpLoss, bucket: bucketFromCpLoss(cpLoss, evalBeforeAbs) });
+    onProgress && onProgress(i + 1, plies.length);
+  }
+
+  const counts = { genius: 0, best: 0, good: 0, inaccuracy: 0, mistake: 0, blunder: 0 };
+  results.forEach((r) => counts[r.bucket]++);
+
+  return { ok: true, counts, moveResults: results };
 }
 
 // ---------- KPI computation ----------
-function computeGameKPIs(game) {
-  const { moves } = game.parsed;
-  const counts = classifyMoves(moves);
+function computeGameKPIs(game, resolvedSide, externalCounts, externalMoveResults) {
+  const { moves, tags } = game.parsed;
+  const mine = userMoves(moves, resolvedSide);
+  const counts = externalCounts || classifyMoves(mine);
   const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
   const errorWeight = counts.blunder * 3 + counts.mistake * 2 + counts.inaccuracy * 1;
   const errorRate = errorWeight / total;
-  const phases = { opening: moves.slice(0, 12), middlegame: moves.slice(12, 32), endgame: moves.slice(32) };
+
   const phaseErr = {};
-  Object.entries(phases).forEach(([k, arr]) => {
-    const c = classifyMoves(arr);
-    const t = Object.values(c).reduce((a, b) => a + b, 0) || 1;
-    phaseErr[k] = (c.blunder * 3 + c.mistake * 2 + c.inaccuracy) / t;
-  });
-  const weakestPhase = Object.entries(phaseErr).sort((a, b) => b[1] - a[1])[0]?.[0] || "middlegame";
+  let weakestPhase;
+
+  if (externalMoveResults && externalMoveResults.length > 0) {
+    // Real engine data available (Stockfish/Lichess), already in game order and already
+    // filtered to the user's own moves — split by ply position for an accurate phase
+    // breakdown, rather than re-running the annotation-text classifier (which returns all
+    // zeros here since engine-analysed PGNs typically carry no !!/?!/?? glyphs at all).
+    const phaseSlices = {
+      opening: externalMoveResults.slice(0, 6),
+      middlegame: externalMoveResults.slice(6, 16),
+      endgame: externalMoveResults.slice(16),
+    };
+    Object.entries(phaseSlices).forEach(([k, arr]) => {
+      if (arr.length === 0) { phaseErr[k] = 0; return; }
+      const weight = arr.reduce((sum, r) => sum + (r.bucket === "blunder" ? 3 : r.bucket === "mistake" ? 2 : r.bucket === "inaccuracy" ? 1 : 0), 0);
+      phaseErr[k] = weight / arr.length;
+    });
+  } else {
+    // Fallback: annotation-text classifier on the user's move subset (Chessis-style PGNs).
+    const phases = { opening: mine.slice(0, 6), middlegame: mine.slice(6, 16), endgame: mine.slice(16) };
+    Object.entries(phases).forEach(([k, arr]) => {
+      const c = classifyMoves(arr);
+      const t = Object.values(c).reduce((a, b) => a + b, 0) || 1;
+      phaseErr[k] = (c.blunder * 3 + c.mistake * 2 + c.inaccuracy) / t;
+    });
+  }
+
+  weakestPhase = Object.entries(phaseErr).sort((a, b) => b[1] - a[1])[0]?.[0] || "middlegame";
   return { counts, errorRate, phaseErr, weakestPhase, totalMoves: total };
 }
 
@@ -104,7 +528,7 @@ function aggregateKPIs(games) {
   const phaseAgg = { opening: [], middlegame: [], endgame: [] };
   games.forEach((g) => {
     const fam = openingFamily(g.parsed.tags.Opening || g.parsed.tags.ECO);
-    const result = detectResult(g.parsed.tags);
+    const result = detectResult(g.parsed.tags, g.resolvedSide);
     if (!byOpening[fam]) byOpening[fam] = { games: 0, wins: 0, losses: 0, draws: 0, errorRateSum: 0 };
     byOpening[fam].games++;
     if (result.outcome === "vitória") { byOpening[fam].wins++; wins++; }
@@ -223,7 +647,7 @@ function SectionLabel({ children }) {
 }
 
 function GameRow({ game, onClick }) {
-  const result = detectResult(game.parsed.tags);
+  const result = detectResult(game.parsed.tags, game.resolvedSide);
   const tone = result.outcome === "vitória" ? "good" : result.outcome === "derrota" ? "bad" : "neutral";
   return React.createElement("button", {
     onClick, style: { display: "flex", justifyContent: "space-between", alignItems: "center", background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "12px 16px", cursor: "pointer", textAlign: "left", width: "100%", color: C.ink }
@@ -318,7 +742,7 @@ function DashboardView({ games, agg, agg20, last20, tips, onGoAdd, onGoHistory, 
   );
 }
 
-function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, setEngineMode, onAdd, analyzing, status }) {
+function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, setEngineMode, onAdd, analyzing, status, onImportPgnFile, batchImportStatus }) {
   const labelStyle = { fontSize: 12, letterSpacing: "0.05em", textTransform: "uppercase", color: C.inkFaint, marginBottom: 8, display: "block", fontWeight: 600 };
   const selectStyle = { width: "100%", background: C.bgPanel2, border: `1px solid ${C.line}`, borderRadius: 6, color: C.ink, padding: "10px 12px", fontSize: 14 };
   return React.createElement("div", { style: { maxWidth: 640, margin: "0 auto" } },
@@ -338,7 +762,7 @@ function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, set
         React.createElement("label", { style: labelStyle }, "Modo de análise"),
         React.createElement("select", { value: engineMode, onChange: (e) => setEngineMode(e.target.value), style: selectStyle },
           React.createElement("option", { value: "none" }, "Sem engine (usa anotações do PGN)"),
-          React.createElement("option", { value: "lichess-cloud" }, "API do Lichess (cloud)"),
+          React.createElement("option", { value: "lichess-cloud" }, "API do Lichess (semi-manual)"),
           React.createElement("option", { value: "stockfish-js" }, "Stockfish.js no navegador")
         )
       )
@@ -356,8 +780,31 @@ function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, set
       onClick: onAdd, disabled: analyzing,
       style: { background: analyzing ? C.brassDim : C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "12px 24px", fontWeight: 700, fontSize: 14, cursor: analyzing ? "default" : "pointer", width: "100%" }
     }, analyzing ? "Analisando…" : "Adicionar e analisar"),
-    React.createElement("p", { style: { fontSize: 12, color: C.inkFaint, marginTop: 12, lineHeight: 1.6 } },
-      "Nota sobre engines: o modo \"sem engine\" usa as anotações (!!, !, ?!, ?, ??) já presentes no PGN exportado. O modo Lichess cloud importa a partida para análise externa. O modo Stockfish.js depende do navegador suportar WebAssembly."
+    React.createElement("p", { style: { fontSize: 12, color: C.inkFaint, marginTop: 12, marginBottom: 28, lineHeight: 1.6 } },
+      "Nota sobre engines: o modo \"sem engine\" usa as anotações (!!, !, ?!, ?, ??) já presentes no PGN — rápido, mas só funciona se a fonte já anotou (Chessis faz isso; PGN cru do Chess.com/Lichess geralmente não). O modo Stockfish.js roda análise real, local no navegador — mais lento, mas totalmente automático. O modo Lichess é semi-manual: a API do Lichess não tem como acionar a análise sozinha, então depois de importar a partida, você mesmo abre o link, clica em \"Request a computer analysis\" no site, espera terminar, e volta aqui para buscar o resultado."
+    ),
+
+    React.createElement("div", { style: { borderTop: `1px solid ${C.line}`, paddingTop: 24 } },
+      React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 18, marginBottom: 4 } }, "Ou envie um arquivo .pgn com várias partidas"),
+      React.createElement("p", { style: { color: C.inkDim, fontSize: 13.5, marginBottom: 16, lineHeight: 1.6 } },
+        "Use isto para o export do Chessis quando você seleciona várias partidas de uma vez — o arquivo baixado contém todas juntas, e este envio separa e adiciona cada uma automaticamente. Usa o modo de análise escolhido acima (o modo Lichess semi-manual não está disponível aqui, já que exige um clique manual por partida — use o modo Stockfish.js ou sem engine para lotes)."
+      ),
+      batchImportStatus && React.createElement("div", {
+        style: { padding: "10px 14px", borderRadius: 6, marginBottom: 14, fontSize: 13, background: "rgba(201,162,75,0.12)", color: C.brass }
+      }, `Processando partida ${batchImportStatus.current}/${batchImportStatus.total}… (${batchImportStatus.added} adicionada(s), ${batchImportStatus.skipped} pulada(s) até agora)`),
+      React.createElement("label", {
+        style: {
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+          background: "transparent", border: `1px dashed ${C.brassDim}`, borderRadius: 8,
+          color: C.brass, padding: "16px", fontSize: 13.5, fontWeight: 600, cursor: batchImportStatus ? "default" : "pointer",
+          opacity: batchImportStatus ? 0.6 : 1,
+        }
+      },
+        batchImportStatus ? "Processando…" : "Escolher arquivo .pgn",
+        React.createElement("input", {
+          type: "file", accept: ".pgn,.txt", onChange: onImportPgnFile, disabled: !!batchImportStatus, style: { display: "none" }
+        })
+      )
     )
   );
 }
@@ -368,7 +815,7 @@ function HistoryView({ games, onSelect, onDelete }) {
     React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 22, marginBottom: 20 } }, `Histórico completo (${games.length})`),
     React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
       [...games].reverse().map((g) => {
-        const result = detectResult(g.parsed.tags);
+        const result = detectResult(g.parsed.tags, g.resolvedSide);
         const tone = result.outcome === "vitória" ? "good" : result.outcome === "derrota" ? "bad" : "neutral";
         return React.createElement("div", { key: g.id, style: { display: "flex", justifyContent: "space-between", alignItems: "center", background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "12px 16px" } },
           React.createElement("button", { onClick: () => onSelect(g.id), style: { background: "none", border: "none", color: C.ink, textAlign: "left", cursor: "pointer", flex: 1 } },
@@ -386,7 +833,7 @@ function HistoryView({ games, onSelect, onDelete }) {
 }
 
 function GameDetailView({ game, onBack }) {
-  const result = detectResult(game.parsed.tags);
+  const result = detectResult(game.parsed.tags, game.resolvedSide);
   const { counts, errorRate, phaseErr, weakestPhase } = game.kpis;
   const phaseNames = { opening: "Abertura", middlegame: "Meio-jogo", endgame: "Final" };
   const rows = [
@@ -425,8 +872,124 @@ function GameDetailView({ game, onBack }) {
   );
 }
 
+function SideChoiceModal({ tags, onChoose, onCancel }) {
+  return React.createElement("div", {
+    style: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10000, padding: 20 }
+  },
+    React.createElement("div", { style: { background: C.bgPanel, border: `1px solid ${C.brassDim}`, borderRadius: 10, padding: 24, maxWidth: 420, width: "100%" } },
+      React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 18, marginBottom: 10 } }, "Qual lado você jogou?"),
+      React.createElement("p", { style: { color: C.inkDim, fontSize: 13.5, marginBottom: 18, lineHeight: 1.6 } },
+        `Não reconheci automaticamente pelo PGN. Brancas: "${tags.White || "?"}" · Pretas: "${tags.Black || "?"}". Escolha seu lado nesta partida — isso não muda seu usuário salvo.`
+      ),
+      React.createElement("div", { style: { display: "flex", gap: 10, marginBottom: 12 } },
+        React.createElement("button", {
+          onClick: () => onChoose("white"),
+          style: { flex: 1, background: C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "12px 14px", fontWeight: 700, cursor: "pointer" }
+        }, `Brancas (${tags.White || "?"})`),
+        React.createElement("button", {
+          onClick: () => onChoose("black"),
+          style: { flex: 1, background: C.felt, color: C.bg, border: "none", borderRadius: 6, padding: "12px 14px", fontWeight: 700, cursor: "pointer" }
+        }, `Pretas (${tags.Black || "?"})`)
+      ),
+      React.createElement("button", {
+        onClick: onCancel,
+        style: { width: "100%", background: "none", border: `1px solid ${C.line}`, color: C.inkDim, borderRadius: 6, padding: "9px 14px", fontSize: 13, cursor: "pointer" }
+      }, "Cancelar")
+    )
+  );
+}
+
+function SettingsView({ settings, onSave }) {
+  const [newUsername, setNewUsername] = useState("");
+  const usernames = settings.usernames || [];
+
+  const addUsername = () => {
+    const trimmed = newUsername.trim();
+    if (!trimmed) return;
+    if (usernames.some((u) => u.toLowerCase() === trimmed.toLowerCase())) { setNewUsername(""); return; }
+    onSave({ ...settings, usernames: [...usernames, trimmed] });
+    setNewUsername("");
+  };
+
+  const removeUsername = (u) => {
+    onSave({ ...settings, usernames: usernames.filter((x) => x !== u) });
+  };
+
+  const labelStyle = { fontSize: 12, letterSpacing: "0.05em", textTransform: "uppercase", color: C.inkFaint, marginBottom: 8, display: "block", fontWeight: 600 };
+
+  return React.createElement("div", { style: { maxWidth: 560, margin: "0 auto" } },
+    React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 22, marginBottom: 4 } }, "Configurações"),
+    React.createElement("p", { style: { color: C.inkDim, fontSize: 13.5, marginBottom: 24, lineHeight: 1.6 } },
+      "Salve seus usernames de Lichess, Chess.com etc. O app usa essa lista para identificar automaticamente qual lado (brancas/pretas) é você em PGNs que não dizem \"Você\" explicitamente. Quando o username não bate com nenhum salvo, o app pergunta na hora."
+    ),
+    React.createElement("label", { style: labelStyle }, "Adicionar username"),
+    React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 20 } },
+      React.createElement("input", {
+        value: newUsername, onChange: (e) => setNewUsername(e.target.value),
+        onKeyDown: (e) => { if (e.key === "Enter") addUsername(); },
+        placeholder: "ex: bkskyline123",
+        style: { flex: 1, background: C.bgPanel2, border: `1px solid ${C.line}`, borderRadius: 6, color: C.ink, padding: "10px 12px", fontSize: 14 }
+      }),
+      React.createElement("button", {
+        onClick: addUsername,
+        style: { background: C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "10px 18px", fontWeight: 700, cursor: "pointer" }
+      }, "Adicionar")
+    ),
+    React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
+      usernames.length === 0
+        ? React.createElement("p", { style: { color: C.inkFaint, fontSize: 13 } }, "Nenhum username salvo ainda.")
+        : usernames.map((u) => React.createElement("div", {
+            key: u, style: { display: "flex", justifyContent: "space-between", alignItems: "center", background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "10px 14px" }
+          },
+            React.createElement("span", { style: { fontSize: 13.5 } }, u),
+            React.createElement("button", {
+              onClick: () => removeUsername(u),
+              style: { background: "none", border: `1px solid ${C.line}`, color: C.rustBright, borderRadius: 6, padding: "4px 10px", fontSize: 12, cursor: "pointer" }
+            }, "Remover")
+          ))
+    )
+  );
+}
+
+function LichessPendingModal({ pending, status, onFetch, onCancel }) {
+  return React.createElement("div", {
+    style: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10000, padding: 20 }
+  },
+    React.createElement("div", { style: { background: C.bgPanel, border: `1px solid ${C.brassDim}`, borderRadius: 10, padding: 24, maxWidth: 460, width: "100%" } },
+      React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 18, marginBottom: 10 } }, "Partida importada no Lichess"),
+      React.createElement("p", { style: { color: C.inkDim, fontSize: 13.5, marginBottom: 16, lineHeight: 1.6 } },
+        "O Lichess não permite acionar a análise automaticamente por API — só pelo site. Siga os passos:"
+      ),
+      React.createElement("ol", { style: { color: C.inkDim, fontSize: 13.5, lineHeight: 1.9, marginBottom: 18, paddingLeft: 20 } },
+        React.createElement("li", null,
+          "Abra a partida: ",
+          React.createElement("a", { href: pending.url, target: "_blank", rel: "noopener noreferrer", style: { color: C.brass, fontWeight: 700 } }, pending.url)
+        ),
+        React.createElement("li", null, "Clique em \"Request a computer analysis\" (ou \"Análise do computador\")"),
+        React.createElement("li", null, "Espere terminar (geralmente ~30-60s)"),
+        React.createElement("li", null, "Volte aqui e clique em \"Buscar análise\" abaixo")
+      ),
+      status && React.createElement("div", {
+        style: { padding: "10px 14px", borderRadius: 6, marginBottom: 14, fontSize: 13, background: status.loading ? "rgba(201,162,75,0.12)" : "rgba(181,83,60,0.12)", color: status.loading ? C.brass : C.rustBright }
+      }, status.loading ? "Buscando análise…" : status.msg),
+      React.createElement("div", { style: { display: "flex", gap: 10 } },
+        React.createElement("button", {
+          onClick: onFetch,
+          disabled: status && status.loading,
+          style: { flex: 1, background: C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "12px 14px", fontWeight: 700, cursor: status && status.loading ? "default" : "pointer" }
+        }, status && status.loading ? "Buscando…" : "Buscar análise"),
+        React.createElement("button", {
+          onClick: onCancel,
+          style: { background: "none", border: `1px solid ${C.line}`, color: C.inkDim, borderRadius: 6, padding: "12px 14px", fontSize: 13, cursor: "pointer" }
+        }, "Cancelar")
+      )
+    )
+  );
+}
+
 function App() {
   const [games, setGames] = useState(loadGames());
+  const [settings, setSettings] = useState(loadSettings());
   const [tab, setTab] = useState("dashboard");
   const [pgnInput, setPgnInput] = useState("");
   const [source, setSource] = useState("chessis");
@@ -434,8 +997,93 @@ function App() {
   const [selectedGameId, setSelectedGameId] = useState(null);
   const [addStatus, setAddStatus] = useState(null);
   const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeProgress, setAnalyzeProgress] = useState(null);
+  // When side detection fails, we stash the pending add here and ask the user to pick.
+  const [pendingSideChoice, setPendingSideChoice] = useState(null);
+  // Lichess semi-manual flow: after import, the person must open the Lichess link,
+  // click "Request a computer analysis" themselves (no public API for that action),
+  // wait for it to finish, then come back and click "Buscar análise" to complete the save.
+  const [pendingLichessImport, setPendingLichessImport] = useState(null);
+  const [lichessFetchStatus, setLichessFetchStatus] = useState(null);
 
   const persist = useCallback((next) => { setGames(next); saveGames(next); }, []);
+  const persistSettings = useCallback((next) => { setSettings(next); saveSettings(next); }, []);
+
+  const saveGameWithCounts = (pgnText, resolvedSide, externalCounts, engineNote, externalMoveResults) => {
+    const parsed = parsePGN(pgnText);
+    const kpis = computeGameKPIs({ parsed }, resolvedSide, externalCounts, externalMoveResults);
+    const newGame = {
+      id: `g_${Date.now()}`, source, engineMode, engineNote, resolvedSide,
+      addedAt: new Date().toISOString(), parsed, kpis,
+    };
+    const next = [...games, newGame];
+    persist(next);
+    setPgnInput("");
+    setAddStatus({ ok: true, msg: "Partida adicionada e analisada." });
+    setTab("dashboard");
+  };
+
+  const runAnalysisAndSave = async (pgnText, resolvedSide) => {
+    const parsed = parsePGN(pgnText);
+
+    if (engineMode === "lichess-cloud") {
+      // Step 1 only: import and pause here. Saving happens later via completeLichessAnalysis.
+      const r = await importToLichess(pgnText);
+      if (r.ok) {
+        setPendingLichessImport({ pgnText, resolvedSide, gameId: r.id, url: r.url });
+        setAddStatus(null);
+      } else {
+        const msg = r.reason === "proxy_html_response"
+          ? "O proxy dedicado (Cloudflare Worker) não respondeu corretamente agora — tente de novo em instantes."
+          : "Não consegui importar a partida no Lichess agora (proxy ou rede). Tente de novo.";
+        setAddStatus({ ok: false, msg });
+      }
+      return; // don't fall through to saveGameWithCounts — waiting on manual step
+    }
+
+    let engineNote = "Classificação baseada nas anotações (!!/!/?!/?/??) presentes no PGN.";
+    let externalCounts = null;
+    let externalMoveResults = null;
+
+    if (engineMode === "stockfish-js") {
+      setAnalyzeProgress({ current: 0, total: parsed.moves.length });
+      const r = await analyzeWithStockfish(pgnText, resolvedSide, (cur, tot) => setAnalyzeProgress({ current: cur, total: tot }));
+      setAnalyzeProgress(null);
+      if (r.ok) {
+        externalCounts = r.counts;
+        externalMoveResults = r.moveResults;
+        engineNote = "Analisado com Stockfish.js local, lance a lance, no seu navegador.";
+      } else {
+        engineNote = "Stockfish.js indisponível neste navegador agora — usando anotações do PGN como fallback.";
+      }
+    }
+
+    saveGameWithCounts(pgnText, resolvedSide, externalCounts, engineNote, externalMoveResults);
+  };
+
+  // Step 2 of the Lichess flow, triggered by the "Buscar análise" button after the person
+  // has manually clicked "Request a computer analysis" on the Lichess page and waited.
+  const completeLichessAnalysis = async () => {
+    if (!pendingLichessImport) return;
+    const { pgnText, resolvedSide, gameId, url } = pendingLichessImport;
+    setLichessFetchStatus({ loading: true });
+    const r = await fetchLichessAnalysis(gameId, pgnText, resolvedSide);
+    if (r.ok) {
+      setPendingLichessImport(null);
+      setLichessFetchStatus(null);
+      saveGameWithCounts(pgnText, resolvedSide, r.counts, `Analisado pelo motor do Lichess. Partida: ${url}`, r.moveResults);
+    } else if (r.reason === "analysis_not_ready") {
+      setLichessFetchStatus({ loading: false, msg: "A análise ainda não apareceu no Lichess. Confirme que clicou em \"Request a computer analysis\" na aba do Lichess e espere mais um pouco antes de tentar de novo." });
+    } else {
+      setLichessFetchStatus({ loading: false, msg: "Não consegui buscar a análise agora (proxy ou rede). Tente de novo em instantes." });
+    }
+  };
+
+  const cancelLichessImport = () => {
+    setPendingLichessImport(null);
+    setLichessFetchStatus(null);
+    setAnalyzing(false);
+  };
 
   const handleAddGame = async () => {
     if (!pgnInput.trim()) { setAddStatus({ ok: false, msg: "Cole um PGN antes de adicionar." }); return; }
@@ -446,20 +1094,27 @@ function App() {
         setAddStatus({ ok: false, msg: "Não consegui identificar lances nesse PGN. Verifique o formato." });
         setAnalyzing(false); return;
       }
-      let engineNote = "Classificação baseada nas anotações (!!/!/?!/?/??) presentes no PGN.";
-      if (engineMode === "lichess-cloud") {
-        const r = await analyzeWithLichessCloud(pgnInput);
-        engineNote = r.ok ? `Importado ao Lichess para análise: ${r.url}` : "Análise via Lichess indisponível agora — usando anotações do PGN como fallback.";
-      } else if (engineMode === "stockfish-js") {
-        engineNote = "Stockfish.js não está incluído nesta build — usando anotações do PGN como fallback.";
+      const side = detectUserSide(parsed.tags, settings.usernames);
+      if (side === "unknown") {
+        // Pause here and ask the user which color they played — resume via resolvePendingSide.
+        setPendingSideChoice({ pgnText: pgnInput, tags: parsed.tags });
+        setAnalyzing(false);
+        return;
       }
-      const kpis = computeGameKPIs({ parsed });
-      const newGame = { id: `g_${Date.now()}`, source, engineMode, engineNote, addedAt: new Date().toISOString(), parsed, kpis };
-      const next = [...games, newGame];
-      persist(next);
-      setPgnInput("");
-      setAddStatus({ ok: true, msg: "Partida adicionada e analisada." });
-      setTab("dashboard");
+      await runAnalysisAndSave(pgnInput, side);
+    } catch (e) {
+      setAddStatus({ ok: false, msg: "Erro ao processar o PGN: " + e.message });
+    }
+    setAnalyzing(false);
+  };
+
+  const resolvePendingSide = async (side) => {
+    if (!pendingSideChoice) return;
+    const { pgnText } = pendingSideChoice;
+    setPendingSideChoice(null);
+    setAnalyzing(true);
+    try {
+      await runAnalysisAndSave(pgnText, side);
     } catch (e) {
       setAddStatus({ ok: false, msg: "Erro ao processar o PGN: " + e.message });
     }
@@ -480,6 +1135,85 @@ function App() {
     a.download = `painel-tatico-backup-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const [batchImportStatus, setBatchImportStatus] = useState(null);
+
+  const handleImportPgnFile = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    e.target.value = "";
+
+    const text = await file.text();
+    const gamePgns = splitMultiGamePgn(text);
+    if (gamePgns.length === 0) {
+      setAddStatus({ ok: false, msg: "Não encontrei nenhuma partida nesse arquivo." });
+      return;
+    }
+
+    setBatchImportStatus({ current: 0, total: gamePgns.length, skipped: 0, added: 0 });
+
+    let added = 0;
+    let skipped = 0;
+    const skippedReasons = [];
+
+    for (let i = 0; i < gamePgns.length; i++) {
+      setBatchImportStatus({ current: i + 1, total: gamePgns.length, skipped, added });
+      const pgnText = gamePgns[i];
+      const parsed = parsePGN(pgnText);
+      if (parsed.moves.length === 0) {
+        skipped++;
+        skippedReasons.push(`Partida ${i + 1}: não consegui identificar lances.`);
+        continue;
+      }
+      const side = detectUserSide(parsed.tags, settings.usernames);
+      if (side === "unknown") {
+        // Batch mode doesn't stop to ask per-game — that would defeat the point of bulk
+        // import. Games with an unresolvable side are skipped and reported at the end;
+        // the person can add those individually via the normal single-PGN flow where the
+        // side-choice modal is available.
+        skipped++;
+        skippedReasons.push(`Partida ${i + 1} (${parsed.tags.White || "?"} vs ${parsed.tags.Black || "?"}): não consegui identificar qual lado é você — adicione manualmente.`);
+        continue;
+      }
+
+      // Batch mode only supports "sem engine" or Stockfish.js — the Lichess semi-manual
+      // flow requires a manual click per game on lichess.org, which doesn't fit a bulk
+      // import of potentially dozens of games.
+      let engineNote = "Classificação baseada nas anotações (!!/!/?!/?/??) presentes no PGN.";
+      let externalCounts = null;
+      let externalMoveResults = null;
+      if (engineMode === "stockfish-js") {
+        const r = await analyzeWithStockfish(pgnText, side, () => {});
+        if (r.ok) {
+          externalCounts = r.counts;
+          externalMoveResults = r.moveResults;
+          engineNote = "Analisado com Stockfish.js local, lance a lance, no seu navegador.";
+        } else {
+          engineNote = "Stockfish.js indisponível — usando anotações do PGN como fallback.";
+        }
+      }
+
+      const kpis = computeGameKPIs({ parsed }, side, externalCounts, externalMoveResults);
+      const newGame = {
+        id: `g_${Date.now()}_${i}`, source, engineMode: engineMode === "lichess-cloud" ? "none" : engineMode,
+        engineNote, resolvedSide: side, addedAt: new Date().toISOString(), parsed, kpis,
+      };
+      setGames((prev) => {
+        const next = [...prev, newGame];
+        saveGames(next);
+        return next;
+      });
+      added++;
+    }
+
+    setBatchImportStatus(null);
+    const summary = `${added} partida(s) adicionada(s)${skipped > 0 ? `, ${skipped} pulada(s)` : ""}.`;
+    setAddStatus({
+      ok: added > 0,
+      msg: skipped > 0 ? `${summary} ${skippedReasons.join(" ")}` : summary,
+    });
+    if (added > 0) setTab("dashboard");
   };
 
   const handleImport = (e) => {
@@ -516,7 +1250,7 @@ function App() {
           React.createElement("span", { style: { color: C.brassDim, fontSize: 13 } }, "KPIs de xadrez, não estatística vazia")
         ),
         React.createElement("div", { style: { display: "flex", gap: 6, marginTop: 18, flexWrap: "wrap" } },
-          [["dashboard", "Visão geral"], ["add", "Adicionar partida"], ["history", "Histórico"]].map(([key, label]) =>
+          [["dashboard", "Visão geral"], ["add", "Adicionar partida"], ["history", "Histórico"], ["settings", "Configurações"]].map(([key, label]) =>
             React.createElement("button", {
               key, onClick: () => setTab(key),
               style: { background: tab === key ? C.brass : "transparent", color: tab === key ? C.bg : C.inkDim, border: `1px solid ${tab === key ? C.brass : C.line}`, borderRadius: 6, padding: "7px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer" }
@@ -530,8 +1264,23 @@ function App() {
         )
       )
     ),
+    pendingSideChoice && React.createElement(SideChoiceModal, {
+      tags: pendingSideChoice.tags,
+      onChoose: resolvePendingSide,
+      onCancel: () => setPendingSideChoice(null),
+    }),
+    pendingLichessImport && React.createElement(LichessPendingModal, {
+      pending: pendingLichessImport,
+      status: lichessFetchStatus,
+      onFetch: completeLichessAnalysis,
+      onCancel: cancelLichessImport,
+    }),
+    analyzeProgress && React.createElement("div", {
+      style: { position: "fixed", bottom: 16, left: "50%", transform: "translateX(-50%)", background: C.bgPanel2, border: `1px solid ${C.brassDim}`, borderRadius: 8, padding: "10px 18px", fontSize: 13, color: C.brass, zIndex: 9998 }
+    }, `Analisando com Stockfish… lance ${analyzeProgress.current}/${analyzeProgress.total}`),
     React.createElement("div", { style: { maxWidth: 880, margin: "0 auto", padding: "24px 20px" } },
-      tab === "add" ? React.createElement(AddGameView, { pgnInput, setPgnInput, source, setSource, engineMode, setEngineMode, onAdd: handleAddGame, analyzing, status: addStatus })
+      tab === "add" ? React.createElement(AddGameView, { pgnInput, setPgnInput, source, setSource, engineMode, setEngineMode, onAdd: handleAddGame, analyzing, status: addStatus, onImportPgnFile: handleImportPgnFile, batchImportStatus })
+      : tab === "settings" ? React.createElement(SettingsView, { settings, onSave: persistSettings })
       : tab === "history" ? React.createElement(HistoryView, { games, onSelect: (id) => { setSelectedGameId(id); setTab("game"); }, onDelete: handleDeleteGame })
       : tab === "game" && selectedGame ? React.createElement(GameDetailView, { game: selectedGame, onBack: () => setTab("history") })
       : React.createElement(DashboardView, { games, agg, agg20, last20, tips, onGoAdd: () => setTab("add"), onGoHistory: () => setTab("history"), onSelectGame: (id) => { setSelectedGameId(id); setTab("game"); } })
