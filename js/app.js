@@ -165,7 +165,13 @@ function extractLichessEvals(pgnWithEvals) {
 // Imports a PGN to Lichess (via CORS proxy), polls its export endpoint until the analysis
 // (%eval comments) is present or a timeout is hit, then classifies the user's own moves
 // by centipawn loss — same bucket vocabulary as the local Stockfish path.
-async function analyzeWithLichessCloud(pgn, side, onProgress) {
+// Step 1 of the semi-manual Lichess flow: import the PGN and return its Lichess URL.
+// The Lichess API has no endpoint to trigger the "Request a computer analysis" action
+// programmatically — that's a website-only action (confirmed: no such route exists in
+// the public API docs). So after this import, the person needs to open the returned URL,
+// click "Request a computer analysis" themselves, wait for it to finish, then come back
+// and use fetchLichessAnalysis() to pull the now-ready evals.
+async function importToLichess(pgn) {
   try {
     console.log("Lichess: importing PGN via proxy...");
     const importRes = await lichessFetch("https://lichess.org/api/import", {
@@ -185,43 +191,44 @@ async function analyzeWithLichessCloud(pgn, side, onProgress) {
       return { ok: false, reason: "proxy_html_response" };
     }
     console.log("Lichess: import response", data);
-    const gameId = data.id;
-    if (!gameId) {
+    if (!data.id) {
       console.error("Lichess: import response had no game id", data);
       return { ok: false, reason: "no_id" };
     }
+    return { ok: true, id: data.id, url: data.url };
+  } catch (e) {
+    console.error("Lichess: uncaught error during import:", e);
+    return { ok: false, reason: "network" };
+  }
+}
 
-    // Lichess analyses asynchronously after import. Poll the analysed PGN export a few times.
-    const maxAttempts = 8;
-    let pgnWithEvals = null;
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      onProgress && onProgress(attempt + 1, maxAttempts);
-      await new Promise((r) => setTimeout(r, 2500));
-      console.log(`Lichess: polling export, attempt ${attempt + 1}/${maxAttempts}...`);
-      const exportRes = await lichessFetch(`https://lichess.org/game/export/${gameId}?evals=1&clocks=0`, {
-        headers: { Accept: "application/x-chess-pgn" },
-      });
-      if (!exportRes.ok) {
-        console.warn("Lichess: export request failed, status", exportRes.status);
-        continue;
-      }
-      const text = await exportRes.text();
-      const hasEval = text.includes("%eval");
-      console.log(`Lichess: export attempt ${attempt + 1} — has %eval: ${hasEval}, length: ${text.length}`);
-      if (hasEval) { pgnWithEvals = text; break; }
+// Step 2 of the semi-manual Lichess flow: fetch the analysed PGN for a game that has
+// (hopefully) already been analysed by the person clicking "Request a computer analysis"
+// on lichess.org. Single attempt, no polling loop — if it's not ready yet, the person
+// just waits a bit longer and tries this step again.
+async function fetchLichessAnalysis(gameId, pgn, side) {
+  try {
+    console.log("Lichess: fetching analysed PGN for", gameId);
+    const exportRes = await lichessFetch(`https://lichess.org/game/export/${gameId}?evals=1&clocks=0`, {
+      headers: { Accept: "application/x-chess-pgn" },
+    });
+    if (!exportRes.ok) {
+      console.error("Lichess: export request failed, status", exportRes.status);
+      return { ok: false, reason: "export_failed" };
+    }
+    const text = await exportRes.text();
+    const hasEval = text.includes("%eval");
+    console.log(`Lichess: export — has %eval: ${hasEval}, length: ${text.length}`);
+    if (!hasEval) {
+      return { ok: false, reason: "analysis_not_ready" };
     }
 
-    if (!pgnWithEvals) {
-      console.warn("Lichess: analysis not ready after all attempts.");
-      return { ok: false, reason: "analysis_not_ready", url: data.url };
-    }
-
-    const evals = extractLichessEvals(pgnWithEvals);
+    const evals = extractLichessEvals(text);
     const plies = buildPlyList(pgn);
     console.log(`Lichess: extracted ${evals.length} evals, ${plies ? plies.length : 0} plies`);
     if (!plies || evals.length === 0) {
       console.error("Lichess: failed to build ply list or extract evals from analysed PGN.");
-      return { ok: false, reason: "parse_failed", url: data.url };
+      return { ok: false, reason: "parse_failed" };
     }
 
     // evals[i] is the position AFTER ply i was played, from White's perspective.
@@ -239,11 +246,10 @@ async function analyzeWithLichessCloud(pgn, side, onProgress) {
       counts[bucket]++;
       moveResults.push({ san: ply.san, cpLoss, bucket });
     }
-
     console.log("Lichess: final counts", counts);
-    return { ok: true, counts, moveResults, url: data.url };
+    return { ok: true, counts, moveResults };
   } catch (e) {
-    console.error("Lichess: uncaught error in analysis flow:", e);
+    console.error("Lichess: uncaught error during export fetch:", e);
     return { ok: false, reason: "network" };
   }
 }
@@ -684,7 +690,7 @@ function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, set
         React.createElement("label", { style: labelStyle }, "Modo de análise"),
         React.createElement("select", { value: engineMode, onChange: (e) => setEngineMode(e.target.value), style: selectStyle },
           React.createElement("option", { value: "none" }, "Sem engine (usa anotações do PGN)"),
-          React.createElement("option", { value: "lichess-cloud" }, "API do Lichess (proxy próprio)"),
+          React.createElement("option", { value: "lichess-cloud" }, "API do Lichess (semi-manual)"),
           React.createElement("option", { value: "stockfish-js" }, "Stockfish.js no navegador")
         )
       )
@@ -703,7 +709,7 @@ function AddGameView({ pgnInput, setPgnInput, source, setSource, engineMode, set
       style: { background: analyzing ? C.brassDim : C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "12px 24px", fontWeight: 700, fontSize: 14, cursor: analyzing ? "default" : "pointer", width: "100%" }
     }, analyzing ? "Analisando…" : "Adicionar e analisar"),
     React.createElement("p", { style: { fontSize: 12, color: C.inkFaint, marginTop: 12, lineHeight: 1.6 } },
-      "Nota sobre engines: o modo \"sem engine\" usa as anotações (!!, !, ?!, ?, ??) já presentes no PGN — rápido, mas só funciona se a fonte já anotou (Chessis faz isso; PGN cru do Chess.com/Lichess geralmente não). O modo Stockfish.js roda análise real, local no navegador — mais lento, mas funciona em qualquer PGN. O modo Lichess cloud importa a partida e busca a análise deles através de um proxy dedicado (Cloudflare Worker próprio) — pode levar até ~20s."
+      "Nota sobre engines: o modo \"sem engine\" usa as anotações (!!, !, ?!, ?, ??) já presentes no PGN — rápido, mas só funciona se a fonte já anotou (Chessis faz isso; PGN cru do Chess.com/Lichess geralmente não). O modo Stockfish.js roda análise real, local no navegador — mais lento, mas totalmente automático. O modo Lichess é semi-manual: a API do Lichess não tem como acionar a análise sozinha, então depois de importar a partida, você mesmo abre o link, clica em \"Request a computer analysis\" no site, espera terminar, e volta aqui para buscar o resultado."
     )
   );
 }
@@ -850,6 +856,42 @@ function SettingsView({ settings, onSave }) {
   );
 }
 
+function LichessPendingModal({ pending, status, onFetch, onCancel }) {
+  return React.createElement("div", {
+    style: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10000, padding: 20 }
+  },
+    React.createElement("div", { style: { background: C.bgPanel, border: `1px solid ${C.brassDim}`, borderRadius: 10, padding: 24, maxWidth: 460, width: "100%" } },
+      React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 18, marginBottom: 10 } }, "Partida importada no Lichess"),
+      React.createElement("p", { style: { color: C.inkDim, fontSize: 13.5, marginBottom: 16, lineHeight: 1.6 } },
+        "O Lichess não permite acionar a análise automaticamente por API — só pelo site. Siga os passos:"
+      ),
+      React.createElement("ol", { style: { color: C.inkDim, fontSize: 13.5, lineHeight: 1.9, marginBottom: 18, paddingLeft: 20 } },
+        React.createElement("li", null,
+          "Abra a partida: ",
+          React.createElement("a", { href: pending.url, target: "_blank", rel: "noopener noreferrer", style: { color: C.brass, fontWeight: 700 } }, pending.url)
+        ),
+        React.createElement("li", null, "Clique em \"Request a computer analysis\" (ou \"Análise do computador\")"),
+        React.createElement("li", null, "Espere terminar (geralmente ~30-60s)"),
+        React.createElement("li", null, "Volte aqui e clique em \"Buscar análise\" abaixo")
+      ),
+      status && React.createElement("div", {
+        style: { padding: "10px 14px", borderRadius: 6, marginBottom: 14, fontSize: 13, background: status.loading ? "rgba(201,162,75,0.12)" : "rgba(181,83,60,0.12)", color: status.loading ? C.brass : C.rustBright }
+      }, status.loading ? "Buscando análise…" : status.msg),
+      React.createElement("div", { style: { display: "flex", gap: 10 } },
+        React.createElement("button", {
+          onClick: onFetch,
+          disabled: status && status.loading,
+          style: { flex: 1, background: C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "12px 14px", fontWeight: 700, cursor: status && status.loading ? "default" : "pointer" }
+        }, status && status.loading ? "Buscando…" : "Buscar análise"),
+        React.createElement("button", {
+          onClick: onCancel,
+          style: { background: "none", border: `1px solid ${C.line}`, color: C.inkDim, borderRadius: 6, padding: "12px 14px", fontSize: 13, cursor: "pointer" }
+        }, "Cancelar")
+      )
+    )
+  );
+}
+
 function App() {
   const [games, setGames] = useState(loadGames());
   const [settings, setSettings] = useState(loadSettings());
@@ -863,30 +905,51 @@ function App() {
   const [analyzeProgress, setAnalyzeProgress] = useState(null);
   // When side detection fails, we stash the pending add here and ask the user to pick.
   const [pendingSideChoice, setPendingSideChoice] = useState(null);
+  // Lichess semi-manual flow: after import, the person must open the Lichess link,
+  // click "Request a computer analysis" themselves (no public API for that action),
+  // wait for it to finish, then come back and click "Buscar análise" to complete the save.
+  const [pendingLichessImport, setPendingLichessImport] = useState(null);
+  const [lichessFetchStatus, setLichessFetchStatus] = useState(null);
 
   const persist = useCallback((next) => { setGames(next); saveGames(next); }, []);
   const persistSettings = useCallback((next) => { setSettings(next); saveSettings(next); }, []);
 
+  const saveGameWithCounts = (pgnText, resolvedSide, externalCounts, engineNote) => {
+    const parsed = parsePGN(pgnText);
+    const kpis = computeGameKPIs({ parsed }, resolvedSide, externalCounts);
+    const newGame = {
+      id: `g_${Date.now()}`, source, engineMode, engineNote, resolvedSide,
+      addedAt: new Date().toISOString(), parsed, kpis,
+    };
+    const next = [...games, newGame];
+    persist(next);
+    setPgnInput("");
+    setAddStatus({ ok: true, msg: "Partida adicionada e analisada." });
+    setTab("dashboard");
+  };
+
   const runAnalysisAndSave = async (pgnText, resolvedSide) => {
     const parsed = parsePGN(pgnText);
+
+    if (engineMode === "lichess-cloud") {
+      // Step 1 only: import and pause here. Saving happens later via completeLichessAnalysis.
+      const r = await importToLichess(pgnText);
+      if (r.ok) {
+        setPendingLichessImport({ pgnText, resolvedSide, gameId: r.id, url: r.url });
+        setAddStatus(null);
+      } else {
+        const msg = r.reason === "proxy_html_response"
+          ? "O proxy dedicado (Cloudflare Worker) não respondeu corretamente agora — tente de novo em instantes."
+          : "Não consegui importar a partida no Lichess agora (proxy ou rede). Tente de novo.";
+        setAddStatus({ ok: false, msg });
+      }
+      return; // don't fall through to saveGameWithCounts — waiting on manual step
+    }
+
     let engineNote = "Classificação baseada nas anotações (!!/!/?!/?/??) presentes no PGN.";
     let externalCounts = null;
 
-    if (engineMode === "lichess-cloud") {
-      setAnalyzeProgress({ current: 0, total: 8 });
-      const r = await analyzeWithLichessCloud(pgnText, resolvedSide, (cur, tot) => setAnalyzeProgress({ current: cur, total: tot }));
-      setAnalyzeProgress(null);
-      if (r.ok) {
-        externalCounts = r.counts;
-        engineNote = `Analisado pelo motor do Lichess (via proxy dedicado no Cloudflare). Partida importada: ${r.url}`;
-      } else if (r.reason === "analysis_not_ready") {
-        engineNote = `Lichess ainda não terminou de analisar essa partida — tente de novo em ~1 min, ou veja em: ${r.url}. Usando anotações do PGN como fallback por enquanto.`;
-      } else if (r.reason === "proxy_html_response") {
-        engineNote = "O proxy dedicado (Cloudflare Worker) não respondeu corretamente agora — pode ser instabilidade momentânea do worker ou do próprio Lichess. Usando anotações do PGN como fallback por enquanto; tente de novo em instantes.";
-      } else {
-        engineNote = "Análise via Lichess indisponível agora (proxy ou rede) — usando anotações do PGN como fallback.";
-      }
-    } else if (engineMode === "stockfish-js") {
+    if (engineMode === "stockfish-js") {
       setAnalyzeProgress({ current: 0, total: parsed.moves.length });
       const r = await analyzeWithStockfish(pgnText, resolvedSide, (cur, tot) => setAnalyzeProgress({ current: cur, total: tot }));
       setAnalyzeProgress(null);
@@ -898,16 +961,31 @@ function App() {
       }
     }
 
-    const kpis = computeGameKPIs({ parsed }, resolvedSide, externalCounts);
-    const newGame = {
-      id: `g_${Date.now()}`, source, engineMode, engineNote, resolvedSide,
-      addedAt: new Date().toISOString(), parsed, kpis,
-    };
-    const next = [...games, newGame];
-    persist(next);
-    setPgnInput("");
-    setAddStatus({ ok: true, msg: "Partida adicionada e analisada." });
-    setTab("dashboard");
+    saveGameWithCounts(pgnText, resolvedSide, externalCounts, engineNote);
+  };
+
+  // Step 2 of the Lichess flow, triggered by the "Buscar análise" button after the person
+  // has manually clicked "Request a computer analysis" on the Lichess page and waited.
+  const completeLichessAnalysis = async () => {
+    if (!pendingLichessImport) return;
+    const { pgnText, resolvedSide, gameId, url } = pendingLichessImport;
+    setLichessFetchStatus({ loading: true });
+    const r = await fetchLichessAnalysis(gameId, pgnText, resolvedSide);
+    if (r.ok) {
+      setPendingLichessImport(null);
+      setLichessFetchStatus(null);
+      saveGameWithCounts(pgnText, resolvedSide, r.counts, `Analisado pelo motor do Lichess. Partida: ${url}`);
+    } else if (r.reason === "analysis_not_ready") {
+      setLichessFetchStatus({ loading: false, msg: "A análise ainda não apareceu no Lichess. Confirme que clicou em \"Request a computer analysis\" na aba do Lichess e espere mais um pouco antes de tentar de novo." });
+    } else {
+      setLichessFetchStatus({ loading: false, msg: "Não consegui buscar a análise agora (proxy ou rede). Tente de novo em instantes." });
+    }
+  };
+
+  const cancelLichessImport = () => {
+    setPendingLichessImport(null);
+    setLichessFetchStatus(null);
+    setAnalyzing(false);
   };
 
   const handleAddGame = async () => {
@@ -1015,11 +1093,15 @@ function App() {
       onChoose: resolvePendingSide,
       onCancel: () => setPendingSideChoice(null),
     }),
+    pendingLichessImport && React.createElement(LichessPendingModal, {
+      pending: pendingLichessImport,
+      status: lichessFetchStatus,
+      onFetch: completeLichessAnalysis,
+      onCancel: cancelLichessImport,
+    }),
     analyzeProgress && React.createElement("div", {
       style: { position: "fixed", bottom: 16, left: "50%", transform: "translateX(-50%)", background: C.bgPanel2, border: `1px solid ${C.brassDim}`, borderRadius: 8, padding: "10px 18px", fontSize: 13, color: C.brass, zIndex: 9998 }
-    }, engineMode === "lichess-cloud"
-        ? `Aguardando análise do Lichess… tentativa ${analyzeProgress.current}/${analyzeProgress.total}`
-        : `Analisando com Stockfish… lance ${analyzeProgress.current}/${analyzeProgress.total}`),
+    }, `Analisando com Stockfish… lance ${analyzeProgress.current}/${analyzeProgress.total}`),
     React.createElement("div", { style: { maxWidth: 880, margin: "0 auto", padding: "24px 20px" } },
       tab === "add" ? React.createElement(AddGameView, { pgnInput, setPgnInput, source, setSource, engineMode, setEngineMode, onAdd: handleAddGame, analyzing, status: addStatus })
       : tab === "settings" ? React.createElement(SettingsView, { settings, onSave: persistSettings })
