@@ -242,7 +242,8 @@ async function fetchLichessAnalysis(gameId, pgn, side) {
       const after = evals[i];
       const sign = ply.side === "white" ? 1 : -1;
       const cpLoss = (before * sign) - (after * sign);
-      const bucket = bucketFromCpLoss(cpLoss);
+      const evalBeforeAbs = Math.abs(before);
+      const bucket = bucketFromCpLoss(cpLoss, evalBeforeAbs);
       counts[bucket]++;
       moveResults.push({ san: ply.san, cpLoss, bucket });
     }
@@ -372,10 +373,24 @@ function buildPlyList(rawPgn) {
 }
 
 // Classifies centipawn loss into the same bucket vocabulary used elsewhere in the app.
-function bucketFromCpLoss(cpLoss) {
+// Thresholds confirmed from Lichess's own open-source classification logic
+// (github.com/ornicar/lila, modules/analyse/src/main/Advice.scala):
+//   50-99cp  -> Imprecisão (inaccuracy)
+//   100-299cp -> Erro (mistake)
+//   300cp+    -> Erro grave (blunder)
+// Below 50cp is not flagged as an error at all — that's normal play, not "good" vs "best"
+// in a meaningfully different sense worth splitting hairs over here.
+function bucketFromCpLoss(cpLoss, evalBeforeAbs) {
+  // Lichess dampens judgment once a position is already crushing in either direction
+  // (roughly beyond +-8 pawns / 800cp): dropping from +9 to +6 is still totally winning,
+  // so it isn't flagged as a blunder even though the raw centipawn swing is large. Without
+  // this cap, endgame mop-up moves in a won position get misclassified as errors.
+  if (evalBeforeAbs !== undefined && evalBeforeAbs >= 800 && cpLoss < 600) {
+    return cpLoss <= 0 ? "best" : "good";
+  }
   if (cpLoss >= 300) return "blunder";
-  if (cpLoss >= 150) return "mistake";
-  if (cpLoss >= 60) return "inaccuracy";
+  if (cpLoss >= 100) return "mistake";
+  if (cpLoss >= 50) return "inaccuracy";
   if (cpLoss <= -120) return "genius"; // move gained significant advantage vs engine expectation
   if (cpLoss <= 0) return "best";
   return "good";
@@ -415,7 +430,8 @@ async function analyzeWithStockfish(rawPgn, side, onProgress) {
     const before = evalBefore * sign;
     const after = -evalAfter * sign; // after the move, eval is reported from other side's turn
     const cpLoss = before - after;
-    results.push({ san: ply.san, cpLoss, bucket: bucketFromCpLoss(cpLoss) });
+    const evalBeforeAbs = Math.abs(before);
+    results.push({ san: ply.san, cpLoss, bucket: bucketFromCpLoss(cpLoss, evalBeforeAbs) });
     onProgress && onProgress(i + 1, plies.length);
   }
 
@@ -426,7 +442,7 @@ async function analyzeWithStockfish(rawPgn, side, onProgress) {
 }
 
 // ---------- KPI computation ----------
-function computeGameKPIs(game, resolvedSide, externalCounts) {
+function computeGameKPIs(game, resolvedSide, externalCounts, externalMoveResults) {
   const { moves, tags } = game.parsed;
   const mine = userMoves(moves, resolvedSide);
   const counts = externalCounts || classifyMoves(mine);
@@ -434,18 +450,35 @@ function computeGameKPIs(game, resolvedSide, externalCounts) {
   const errorWeight = counts.blunder * 3 + counts.mistake * 2 + counts.inaccuracy * 1;
   const errorRate = errorWeight / total;
 
-  // Phase split: when we have externally-computed per-move buckets (Stockfish), we don't
-  // currently carry ply-order metadata through externalCounts, so phase breakdown still
-  // uses the annotation-based approximation on the user's move subset. This is a known
-  // simplification — good enough for "which third of the game is weakest" at a glance.
-  const phases = { opening: mine.slice(0, 6), middlegame: mine.slice(6, 16), endgame: mine.slice(16) };
   const phaseErr = {};
-  Object.entries(phases).forEach(([k, arr]) => {
-    const c = classifyMoves(arr);
-    const t = Object.values(c).reduce((a, b) => a + b, 0) || 1;
-    phaseErr[k] = (c.blunder * 3 + c.mistake * 2 + c.inaccuracy) / t;
-  });
-  const weakestPhase = Object.entries(phaseErr).sort((a, b) => b[1] - a[1])[0]?.[0] || "middlegame";
+  let weakestPhase;
+
+  if (externalMoveResults && externalMoveResults.length > 0) {
+    // Real engine data available (Stockfish/Lichess), already in game order and already
+    // filtered to the user's own moves — split by ply position for an accurate phase
+    // breakdown, rather than re-running the annotation-text classifier (which returns all
+    // zeros here since engine-analysed PGNs typically carry no !!/?!/?? glyphs at all).
+    const phaseSlices = {
+      opening: externalMoveResults.slice(0, 6),
+      middlegame: externalMoveResults.slice(6, 16),
+      endgame: externalMoveResults.slice(16),
+    };
+    Object.entries(phaseSlices).forEach(([k, arr]) => {
+      if (arr.length === 0) { phaseErr[k] = 0; return; }
+      const weight = arr.reduce((sum, r) => sum + (r.bucket === "blunder" ? 3 : r.bucket === "mistake" ? 2 : r.bucket === "inaccuracy" ? 1 : 0), 0);
+      phaseErr[k] = weight / arr.length;
+    });
+  } else {
+    // Fallback: annotation-text classifier on the user's move subset (Chessis-style PGNs).
+    const phases = { opening: mine.slice(0, 6), middlegame: mine.slice(6, 16), endgame: mine.slice(16) };
+    Object.entries(phases).forEach(([k, arr]) => {
+      const c = classifyMoves(arr);
+      const t = Object.values(c).reduce((a, b) => a + b, 0) || 1;
+      phaseErr[k] = (c.blunder * 3 + c.mistake * 2 + c.inaccuracy) / t;
+    });
+  }
+
+  weakestPhase = Object.entries(phaseErr).sort((a, b) => b[1] - a[1])[0]?.[0] || "middlegame";
   return { counts, errorRate, phaseErr, weakestPhase, totalMoves: total };
 }
 
@@ -914,9 +947,9 @@ function App() {
   const persist = useCallback((next) => { setGames(next); saveGames(next); }, []);
   const persistSettings = useCallback((next) => { setSettings(next); saveSettings(next); }, []);
 
-  const saveGameWithCounts = (pgnText, resolvedSide, externalCounts, engineNote) => {
+  const saveGameWithCounts = (pgnText, resolvedSide, externalCounts, engineNote, externalMoveResults) => {
     const parsed = parsePGN(pgnText);
-    const kpis = computeGameKPIs({ parsed }, resolvedSide, externalCounts);
+    const kpis = computeGameKPIs({ parsed }, resolvedSide, externalCounts, externalMoveResults);
     const newGame = {
       id: `g_${Date.now()}`, source, engineMode, engineNote, resolvedSide,
       addedAt: new Date().toISOString(), parsed, kpis,
@@ -948,6 +981,7 @@ function App() {
 
     let engineNote = "Classificação baseada nas anotações (!!/!/?!/?/??) presentes no PGN.";
     let externalCounts = null;
+    let externalMoveResults = null;
 
     if (engineMode === "stockfish-js") {
       setAnalyzeProgress({ current: 0, total: parsed.moves.length });
@@ -955,13 +989,14 @@ function App() {
       setAnalyzeProgress(null);
       if (r.ok) {
         externalCounts = r.counts;
+        externalMoveResults = r.moveResults;
         engineNote = "Analisado com Stockfish.js local, lance a lance, no seu navegador.";
       } else {
         engineNote = "Stockfish.js indisponível neste navegador agora — usando anotações do PGN como fallback.";
       }
     }
 
-    saveGameWithCounts(pgnText, resolvedSide, externalCounts, engineNote);
+    saveGameWithCounts(pgnText, resolvedSide, externalCounts, engineNote, externalMoveResults);
   };
 
   // Step 2 of the Lichess flow, triggered by the "Buscar análise" button after the person
@@ -974,7 +1009,7 @@ function App() {
     if (r.ok) {
       setPendingLichessImport(null);
       setLichessFetchStatus(null);
-      saveGameWithCounts(pgnText, resolvedSide, r.counts, `Analisado pelo motor do Lichess. Partida: ${url}`);
+      saveGameWithCounts(pgnText, resolvedSide, r.counts, `Analisado pelo motor do Lichess. Partida: ${url}`, r.moveResults);
     } else if (r.reason === "analysis_not_ready") {
       setLichessFetchStatus({ loading: false, msg: "A análise ainda não apareceu no Lichess. Confirme que clicou em \"Request a computer analysis\" na aba do Lichess e espere mais um pouco antes de tentar de novo." });
     } else {
