@@ -18,7 +18,18 @@ function parsePGN(pgn) {
   body = body.replace(/\$\d+/g, "");
   body = body.replace(/\([^()]*\)/g, "");
   body = body.replace(/(1-0|0-1|1\/2-1\/2|\*)\s*$/, "").trim();
-  const moveTokens = body.split(/\s+/).filter((t) => t && !/^\d+\.(\.\.)?$/.test(t) && !/^\d+\.$/.test(t));
+
+  // Move numbers are sometimes glued directly to the move with no space (e.g. "1.e4",
+  // "23.Nxd4" — this is Chess.com's and several other sites' default export format,
+  // not just an edge case). Strip any leading "<digits>.(...)? " prefix from each raw
+  // token BEFORE filtering, so a glued token like "1.e4" becomes "e4" instead of being
+  // left dirty (which would corrupt move text) or, if the old pure-number-token filter
+  // missed it, throw off the white/black ply alignment used everywhere downstream.
+  const rawTokens = body.split(/\s+/).filter(Boolean);
+  const moveTokens = rawTokens
+    .map((t) => t.replace(/^\d+\.(\.\.)?/, ""))
+    .filter((t) => t.length > 0);
+
   return { tags, moves: moveTokens, raw: pgn };
 }
 
