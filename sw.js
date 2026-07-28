@@ -1,4 +1,4 @@
-const CACHE_NAME = "painel-tatico-v4";
+const CACHE_NAME = "painel-tatico-v5";
 const ASSETS = [
   "./",
   "./index.html",
@@ -37,7 +37,7 @@ self.addEventListener("fetch", (event) => {
 
   // Network-first for CDN scripts (React, chess.js, Stockfish) and any proxied/cross-origin
   // request, cache-first for local same-origin assets.
-  if (req.url.includes("unpkg.com") || req.url.includes("jsdelivr.net") || req.url.includes("cdnjs.cloudflare.com") || req.url.includes("workers.dev") || req.url.includes("lichess.org")) {
+  if (req.url.includes("unpkg.com") || req.url.includes("jsdelivr.net") || req.url.includes("cdnjs.cloudflare.com") || req.url.includes("workers.dev") || req.url.includes("lichess.org") || req.url.includes("huggingface.co")) {
     event.respondWith(
       fetch(req).then((res) => {
         const resClone = res.clone();
