@@ -364,34 +364,57 @@ function getStockfishWorker() {
       const blob = new Blob([bootstrap], { type: "application/javascript" });
       const blobUrl = URL.createObjectURL(blob) + wasmHash;
       const worker = new Worker(blobUrl);
-      let handshakeDone = false;
+      let uciokSeen = false;
+      let readyokSeen = false;
 
       worker.addEventListener("error", (err) => {
         console.error("Stockfish worker error (script load or runtime):", err.message || err, "URL:", workerBaseUrl);
-        if (!handshakeDone) reject(err);
+        if (!readyokSeen) reject(err);
       });
 
-      const onFirstMessage = (e) => {
-        if (String(e.data).includes("uciok") || String(e.data).includes("Stockfish")) {
-          handshakeDone = true;
-          console.log("Stockfish handshake OK:", e.data);
-          worker.removeEventListener("message", onFirstMessage);
+      // Proper UCI handshake has two stages, not one:
+      //   1. "uci" -> engine identifies itself, ends with "uciok"
+      //   2. "isready" -> engine confirms it has finished initializing (WASM compiled,
+      //      tables built, etc.) and is truly ready to receive position/go commands,
+      //      ending with "readyok"
+      // A previous version of this code only waited for "uciok" and then immediately
+      // started sending real analysis commands. On mobile, compiling a 7.3MB WASM binary
+      // is a genuinely slow, variable-duration step that can still be in progress after
+      // "uciok" — commands sent too early get silently queued by the engine's own JS
+      // wrapper and processed later in a burst, which produced the suspiciously uniform
+      // "everything landed in one bucket" results seen in testing. Waiting for "readyok"
+      // is the standard, correct way UCI-compliant GUIs confirm an engine can actually work.
+      const onMessage = (e) => {
+        const text = String(e.data);
+        if (!uciokSeen && text.includes("uciok")) {
+          uciokSeen = true;
+          console.log("Stockfish: uciok received, sending isready...");
+          worker.postMessage("isready");
+          return;
+        }
+        if (uciokSeen && !readyokSeen && text.includes("readyok")) {
+          readyokSeen = true;
+          console.log("Stockfish: readyok received — engine genuinely ready.");
+          worker.removeEventListener("message", onMessage);
           resolve(worker);
         }
       };
-      worker.addEventListener("message", onFirstMessage);
+      worker.addEventListener("message", onMessage);
       worker.postMessage("uci");
       _sfWorker = worker;
-      // Safety fallback: some builds respond with different handshake text than expected.
-      // If we haven't resolved by 4s, log it clearly instead of silently proceeding —
-      // this makes "engine loaded but never spoke" visible and distinguishable from
-      // "engine failed to load at all" (which fires the error listener above instead).
+
+      // WASM compile+instantiate on a phone can genuinely take several seconds beyond
+      // the initial script fetch — 4s was too tight and was masking real "not ready yet"
+      // as "proceed anyway". 15s gives real headroom; if it's STILL not ready by then,
+      // something is actually wrong (not just slow), and proceeding anyway at that point
+      // is a reasonable last resort rather than hanging the UI indefinitely.
       setTimeout(() => {
-        if (!handshakeDone) {
-          console.warn("Stockfish handshake timeout — proceeding anyway, but engine may not respond correctly.");
+        if (!readyokSeen) {
+          console.warn(`Stockfish handshake timeout after 15s (uciok seen: ${uciokSeen}, readyok seen: ${readyokSeen}) — proceeding anyway, but results may be unreliable.`);
+          worker.removeEventListener("message", onMessage);
           resolve(worker);
         }
-      }, 4000);
+      }, 15000);
     } catch (err) {
       reject(err);
     }
@@ -399,38 +422,53 @@ function getStockfishWorker() {
   return _sfReady;
 }
 
-// Evaluates a single FEN position with Stockfish, returns centipawn score from White's
-// perspective (positive = White better), or null on mate-in-N scores converted to a large number.
-function evalPositionWithWorker(worker, fen, depth = 10) {
+// Evaluates a single FEN position with Stockfish, returns centipawn score from the
+// perspective of the side to move in that FEN (standard UCI convention).
+function evalPositionWithWorker(worker, fen, movetimeMs = 500) {
   return new Promise((resolve) => {
     let resolved = false;
+    let sawAnyScore = false;
     const onMessage = (e) => {
       const line = typeof e.data === "string" ? e.data : "";
       const mateMatch = line.match(/score mate (-?\d+)/);
       const cpMatch = line.match(/score cp (-?\d+)/);
+      if (mateMatch) { lastScore = (parseInt(mateMatch[1], 10) > 0 ? 1 : -1) * 10000; sawAnyScore = true; }
+      else if (cpMatch) { lastScore = parseInt(cpMatch[1], 10); sawAnyScore = true; }
       if (line.startsWith("bestmove")) {
         if (!resolved) {
           resolved = true;
           worker.removeEventListener("message", onMessage);
+          if (!sawAnyScore) {
+            console.warn("Stockfish: bestmove arrived with no score line ever seen for FEN:", fen);
+          }
           resolve(lastScore);
         }
-        return;
       }
-      if (mateMatch) lastScore = (parseInt(mateMatch[1], 10) > 0 ? 1 : -1) * 10000;
-      else if (cpMatch) lastScore = parseInt(cpMatch[1], 10);
     };
     let lastScore = 0;
     worker.addEventListener("message", onMessage);
     worker.postMessage("position fen " + fen);
-    worker.postMessage("go depth " + depth);
-    // Safety timeout per position so one stuck eval doesn't hang the whole game analysis.
+    // Fixed search TIME rather than fixed DEPTH: depth-based search duration varies a lot
+    // with position complexity (tactical positions with many checks/captures can take far
+    // longer to reach a given depth than quiet ones), which made the old 3s safety timeout
+    // fire inconsistently — sometimes cutting a real search short with no score parsed at
+    // all (silently defaulting to 0, which is what produced the suspiciously uniform
+    // "everything landed in one bucket" result). A fixed movetime budget is predictable
+    // regardless of position complexity.
+    worker.postMessage("go movetime " + movetimeMs);
+    // Safety net comfortably longer than the movetime budget (500ms) itself, so it only
+    // fires if something is genuinely stuck (message lost, engine crashed) rather than
+    // routinely racing the engine's own response.
     setTimeout(() => {
       if (!resolved) {
         resolved = true;
+        if (!sawAnyScore) {
+          console.warn("Stockfish: per-position safety timeout with NO score ever seen for FEN:", fen);
+        }
         worker.removeEventListener("message", onMessage);
         resolve(lastScore);
       }
-    }, 3000);
+    }, 2500);
   });
 }
 
@@ -507,8 +545,8 @@ async function analyzeWithStockfish(rawPgn, side, onProgress) {
       onProgress && onProgress(i + 1, plies.length);
       continue;
     }
-    const evalBefore = await evalPositionWithWorker(worker, ply.fenBefore, 10);
-    const evalAfter = await evalPositionWithWorker(worker, ply.fenAfter, 10);
+    const evalBefore = await evalPositionWithWorker(worker, ply.fenBefore);
+    const evalAfter = await evalPositionWithWorker(worker, ply.fenAfter);
     // Normalize both evals to "how good for the side who just moved"
     const sign = ply.side === "white" ? 1 : -1;
     const before = evalBefore * sign;
@@ -521,6 +559,9 @@ async function analyzeWithStockfish(rawPgn, side, onProgress) {
 
   const counts = { genius: 0, best: 0, good: 0, inaccuracy: 0, mistake: 0, blunder: 0 };
   results.forEach((r) => counts[r.bucket]++);
+
+  console.log("Stockfish: final bucket counts", counts);
+  console.log("Stockfish: sample cpLoss values (first 10 moves)", results.slice(0, 10).map((r) => `${r.san}: ${r.cpLoss}cp (${r.bucket})`));
 
   return { ok: true, counts, moveResults: results };
 }
