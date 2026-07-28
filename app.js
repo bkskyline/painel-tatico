@@ -42,13 +42,34 @@ function parsePGN(pgn) {
 function splitMultiGamePgn(text) {
   const trimmed = text.trim();
   if (!trimmed) return [];
-  // Find every position where a new game's tag block begins.
-  const eventTagRegex = /(?=^\s*\[Event\s+")/gm;
-  const parts = trimmed.split(eventTagRegex).map((p) => p.trim()).filter(Boolean);
-  if (parts.length > 0) return parts;
-  // Fallback: no [Event tags found at all (unusual, but some minimal exports omit tags
-  // entirely) — treat the whole file as one game rather than silently dropping it.
-  return [trimmed];
+
+  // Different PGN sources use different first tags — Chessis uses [App "Chessis"],
+  // Lichess/Chess.com typically use [Event "..."]. Hardcoding one tag name (as a previous
+  // version of this function did) silently fails to split Chessis-style multi-game files
+  // at all, treating the whole file as one giant game and inflating every KPI computed
+  // from it. Instead, detect a new game by finding the first tag line of each tag block —
+  // any line that looks like a PGN tag ([Key "value"]) which isn't immediately preceded
+  // by another tag line — regardless of which specific tag name opens that block.
+  const lines = trimmed.split("\n");
+  const isTagLine = (line) => /^\s*\[\w+\s+"/.test(line);
+  const gameStartLineIndices = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!isTagLine(lines[i])) continue;
+    if (i === 0 || !isTagLine(lines[i - 1])) {
+      gameStartLineIndices.push(i);
+    }
+  }
+
+  if (gameStartLineIndices.length <= 1) return [trimmed];
+
+  const games = [];
+  for (let i = 0; i < gameStartLineIndices.length; i++) {
+    const startLine = gameStartLineIndices[i];
+    const endLine = i + 1 < gameStartLineIndices.length ? gameStartLineIndices[i + 1] : lines.length;
+    const chunk = lines.slice(startLine, endLine).join("\n").trim();
+    if (chunk) games.push(chunk);
+  }
+  return games;
 }
 
 function classifyMoves(moves) {
@@ -102,12 +123,15 @@ function userMoves(moves, side) {
 }
 
 function detectResult(tags, resolvedSide) {
-  const r = tags.Result || "*";
+  const r = (tags.Result || "*").trim();
   const side = resolvedSide || detectUserSide(tags);
   let outcome = "desconhecido";
+  // Standard PGN uses "1/2-1/2" for draws, but some tools (Chessis included) export the
+  // Result tag as plain English text instead — recognize both.
+  const isDraw = r === "1/2-1/2" || r === "1/2" || /^draw$/i.test(r);
   if (r === "1-0") outcome = side === "white" ? "vitória" : side === "black" ? "derrota" : "brancas venceram";
   else if (r === "0-1") outcome = side === "black" ? "vitória" : side === "white" ? "derrota" : "pretas venceram";
-  else if (r === "1/2-1/2") outcome = "empate";
+  else if (isDraw) outcome = "empate";
   return { outcome, userColor: side };
 }
 
@@ -303,11 +327,12 @@ function getStockfishWorker() {
   if (_sfWorker) return _sfReady;
   _sfReady = new Promise((resolve, reject) => {
     try {
-      // Confirmed on npmjs.com/package/stockfish: version 18.x ships fixed (non-hashed)
-      // filenames — stockfish-18-lite-single.js is the lite single-threaded WASM build,
-      // ~7MB, runs without special CORS/COEP headers. Pinned to 18.0.0 rather than "latest"
-      // so the filename contract doesn't shift under us again.
-      const workerUrl = "https://unpkg.com/stockfish@18.0.0/src/stockfish-18-lite-single.js";
+      // Confirmed working by direct fetch inspection (unpkg and jsdelivr both returned
+      // intermittent 403/503 for this file in testing). Hugging Face's cstr/stockfish-js-wasm
+      // repo hosts this exact build (Stockfish 18 lite single-threaded, ~21KB JS loader +
+      // ~7.3MB companion .wasm) specifically for CORS-friendly access from web chess apps —
+      // same GPLv3 Stockfish 18 build from nmrugg/stockfish.js v18.0.0 used by Chess.com.
+      const workerUrl = "https://huggingface.co/cstr/stockfish-js-wasm/resolve/main/stockfish-18-lite-single.js";
 
       // Browsers block `new Worker(crossOriginUrl)` directly (same-origin policy on Worker
       // construction). The standard workaround: create the worker from a same-origin Blob
