@@ -327,13 +327,18 @@ function getStockfishWorker() {
   if (_sfWorker) return _sfReady;
   _sfReady = new Promise((resolve, reject) => {
     try {
-      // Confirmed working by direct fetch inspection (unpkg and jsdelivr both returned
-      // intermittent 403/503 for this file in testing). Hugging Face's cstr/stockfish-js-wasm
-      // repo hosts this exact build (Stockfish 18 lite single-threaded, ~21KB JS loader +
-      // ~7.3MB companion .wasm) specifically for CORS-friendly access from web chess apps —
-      // same GPLv3 Stockfish 18 build from nmrugg/stockfish.js v18.0.0 used by Chess.com.
-      const workerBaseUrl = "https://huggingface.co/cstr/stockfish-js-wasm/resolve/main/stockfish-18-lite-single.js";
-      const wasmUrl = "https://huggingface.co/cstr/stockfish-js-wasm/resolve/main/stockfish.wasm";
+      // Hugging Face hosts the actual Stockfish 18 build (confirmed by direct inspection —
+      // it's the real GPLv3 nmrugg/stockfish.js v18.0.0 build, same one Chess.com uses),
+      // but serves both the .js loader and the .wasm binary with Content-Type: text/plain.
+      // Browsers refuse to execute a script loaded via importScripts() with a non-script
+      // MIME type ("Refused to execute script ... MIME type is not executable" — confirmed
+      // in testing). Routing through our own Cloudflare Worker (the same one handling the
+      // Lichess proxy) fixes this: the Worker fetches from Hugging Face server-side, where
+      // MIME type doesn't matter, and re-serves with the correct Content-Type plus a
+      // week-long Cache-Control header, so repeat loads are fast and don't depend on
+      // Hugging Face being reachable at that moment either.
+      const workerBaseUrl = LICHESS_WORKER_BASE + "/stockfish/stockfish-18-lite-single.js";
+      const wasmUrl = LICHESS_WORKER_BASE + "/stockfish/stockfish.wasm";
 
       // The Stockfish worker script's own self-location logic (visible in its source)
       // reads self.location.hash as comma-separated values: the first is an explicit
@@ -349,6 +354,7 @@ function getStockfishWorker() {
       // importScripts(). So the hash must be appended to the blob URL itself, not to the
       // importScripts() argument, or Stockfish's self.location.hash read will see nothing.
       const wasmHash = "#" + encodeURIComponent(wasmUrl) + ",worker";
+
 
       // Browsers block `new Worker(crossOriginUrl)` directly (same-origin policy on Worker
       // construction). The standard workaround: create the worker from a same-origin Blob
