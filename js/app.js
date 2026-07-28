@@ -327,26 +327,41 @@ function getStockfishWorker() {
   if (_sfWorker) return _sfReady;
   _sfReady = new Promise((resolve, reject) => {
     try {
-      // Confirmed on npmjs.com/package/stockfish: version 18.x ships fixed (non-hashed)
-      // filenames — stockfish-18-lite-single.js is the lite single-threaded WASM build,
-      // ~7MB, runs without special CORS/COEP headers. Pinned to 18.0.0 rather than "latest"
-      // so the filename contract doesn't shift under us again.
-      const workerUrl = "https://unpkg.com/stockfish@18.0.0/src/stockfish-18-lite-single.js";
+      // Confirmed working by direct fetch inspection (unpkg and jsdelivr both returned
+      // intermittent 403/503 for this file in testing). Hugging Face's cstr/stockfish-js-wasm
+      // repo hosts this exact build (Stockfish 18 lite single-threaded, ~21KB JS loader +
+      // ~7.3MB companion .wasm) specifically for CORS-friendly access from web chess apps —
+      // same GPLv3 Stockfish 18 build from nmrugg/stockfish.js v18.0.0 used by Chess.com.
+      const workerBaseUrl = "https://huggingface.co/cstr/stockfish-js-wasm/resolve/main/stockfish-18-lite-single.js";
+      const wasmUrl = "https://huggingface.co/cstr/stockfish-js-wasm/resolve/main/stockfish.wasm";
+
+      // The Stockfish worker script's own self-location logic (visible in its source)
+      // reads self.location.hash as comma-separated values: the first is an explicit
+      // companion-.wasm URL, the second must be the literal string "worker" to select the
+      // correct internal code path. Without this, it falls back to guessing the .wasm path
+      // from `location.origin + location.pathname` — which breaks when the script itself
+      // was loaded via a blob: URL (required here to work around cross-origin Worker
+      // construction limits), producing a mangled, doubled-up URL exactly like the one seen
+      // in testing.
+      //
+      // IMPORTANT: self.location inside a worker reflects the Worker's OWN script URL —
+      // i.e. the blob: URL used in `new Worker(...)` — NOT the URL passed to
+      // importScripts(). So the hash must be appended to the blob URL itself, not to the
+      // importScripts() argument, or Stockfish's self.location.hash read will see nothing.
+      const wasmHash = "#" + encodeURIComponent(wasmUrl) + ",worker";
 
       // Browsers block `new Worker(crossOriginUrl)` directly (same-origin policy on Worker
       // construction). The standard workaround: create the worker from a same-origin Blob
       // whose only content is `importScripts(absoluteUrl)` — importScripts() is allowed to
-      // load cross-origin scripts from inside a worker context, and the Stockfish script's
-      // own internal fetch of its companion .wasm file resolves against that original CDN
-      // URL correctly (not against the blob: URL).
-      const bootstrap = `importScripts(${JSON.stringify(workerUrl)});`;
+      // load cross-origin scripts from inside a worker context.
+      const bootstrap = `importScripts(${JSON.stringify(workerBaseUrl)});`;
       const blob = new Blob([bootstrap], { type: "application/javascript" });
-      const blobUrl = URL.createObjectURL(blob);
+      const blobUrl = URL.createObjectURL(blob) + wasmHash;
       const worker = new Worker(blobUrl);
       let handshakeDone = false;
 
       worker.addEventListener("error", (err) => {
-        console.error("Stockfish worker error (script load or runtime):", err.message || err, "URL:", workerUrl);
+        console.error("Stockfish worker error (script load or runtime):", err.message || err, "URL:", workerBaseUrl);
         if (!handshakeDone) reject(err);
       });
 
