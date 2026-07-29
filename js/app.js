@@ -360,7 +360,29 @@ function getStockfishWorker() {
       // construction). The standard workaround: create the worker from a same-origin Blob
       // whose only content is `importScripts(absoluteUrl)` — importScripts() is allowed to
       // load cross-origin scripts from inside a worker context.
-      const bootstrap = `importScripts(${JSON.stringify(workerBaseUrl)});`;
+      //
+      // The bootstrap also installs its own error/unhandledrejection listeners INSIDE the
+      // worker's global scope, reporting failures back via a distinctively-prefixed
+      // postMessage. This matters because Stockfish's own internal wasm-loading promise
+      // chain ends in `.catch(e => setTimeout(() => { throw e }, 1))` — a deferred re-throw
+      // that doesn't always surface reliably through the main thread's worker.onerror
+      // listener across all browsers/versions. If the wasm fetch is failing or rejecting
+      // inside the worker, this should now catch and report it explicitly instead of the
+      // silence observed in testing.
+      const bootstrap = `
+        self.addEventListener('error', function(e) {
+          postMessage('__BOOTSTRAP_ERROR__ ' + (e.message || e) + ' at ' + (e.filename || '?') + ':' + (e.lineno || '?'));
+        });
+        self.addEventListener('unhandledrejection', function(e) {
+          postMessage('__BOOTSTRAP_REJECTION__ ' + (e.reason && e.reason.message ? e.reason.message : String(e.reason)));
+        });
+        try {
+          importScripts(${JSON.stringify(workerBaseUrl)});
+          postMessage('__BOOTSTRAP_IMPORT_OK__');
+        } catch (e) {
+          postMessage('__BOOTSTRAP_IMPORT_THREW__ ' + (e && e.message ? e.message : String(e)));
+        }
+      `;
       const blob = new Blob([bootstrap], { type: "application/javascript" });
       const blobUrl = URL.createObjectURL(blob) + wasmHash;
       const worker = new Worker(blobUrl);
@@ -386,6 +408,10 @@ function getStockfishWorker() {
       // is the standard, correct way UCI-compliant GUIs confirm an engine can actually work.
       const onMessage = (e) => {
         const text = String(e.data);
+        // Log every message during handshake — including the __BOOTSTRAP_*__ diagnostic
+        // messages and any engine output we don't specifically recognize — so nothing is
+        // silently swallowed while we're still trying to confirm the engine works at all.
+        console.log("Stockfish (handshake phase) message:", text);
         if (!uciokSeen && text.includes("uciok")) {
           uciokSeen = true;
           console.log("Stockfish: uciok received, sending isready...");
