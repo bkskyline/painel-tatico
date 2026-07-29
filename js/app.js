@@ -327,34 +327,16 @@ function getStockfishWorker() {
   if (_sfWorker) return _sfReady;
   _sfReady = new Promise((resolve, reject) => {
     try {
-      // Hugging Face hosts the actual Stockfish 18 build (confirmed by direct inspection —
-      // it's the real GPLv3 nmrugg/stockfish.js v18.0.0 build, same one Chess.com uses),
-      // but serves both the .js loader and the .wasm binary with Content-Type: text/plain.
-      // Browsers refuse to execute a script loaded via importScripts() with a non-script
-      // MIME type ("Refused to execute script ... MIME type is not executable" — confirmed
-      // in testing). Routing through our own Cloudflare Worker (the same one handling the
-      // Lichess proxy) fixes this: the Worker fetches from Hugging Face server-side, where
-      // MIME type doesn't matter, and re-serves with the correct Content-Type plus a
-      // week-long Cache-Control header, so repeat loads are fast and don't depend on
-      // Hugging Face being reachable at that moment either.
-      const workerBaseUrl = LICHESS_WORKER_BASE + "/stockfish/stockfish-18-lite-single.js";
-      const wasmUrl = LICHESS_WORKER_BASE + "/stockfish/stockfish.wasm";
-
-      // The Stockfish worker script's own self-location logic (visible in its source)
-      // reads self.location.hash as comma-separated values: the first is an explicit
-      // companion-.wasm URL, the second must be the literal string "worker" to select the
-      // correct internal code path. Without this, it falls back to guessing the .wasm path
-      // from `location.origin + location.pathname` — which breaks when the script itself
-      // was loaded via a blob: URL (required here to work around cross-origin Worker
-      // construction limits), producing a mangled, doubled-up URL exactly like the one seen
-      // in testing.
-      //
-      // IMPORTANT: self.location inside a worker reflects the Worker's OWN script URL —
-      // i.e. the blob: URL used in `new Worker(...)` — NOT the URL passed to
-      // importScripts(). So the hash must be appended to the blob URL itself, not to the
-      // importScripts() argument, or Stockfish's self.location.hash read will see nothing.
-      const wasmHash = "#" + encodeURIComponent(wasmUrl) + ",worker";
-
+      // Switched from the modern Stockfish 18 WASM build (nmrugg/stockfish.js via Hugging
+      // Face) to the older asm.js build (Stockfish 10, no separate .wasm binary at all).
+      // The WASM build's self-location-hash-driven wasm-path-resolution mechanism produced
+      // total silence in extensive testing (script loaded successfully — confirmed via
+      // __BOOTSTRAP_IMPORT_OK__ — but the engine never responded to any UCI command, and no
+      // error surfaced either). Since asm.js has no companion binary to locate, that entire
+      // class of failure is sidestepped. cdnjs is a proven-reliable CDN in this project
+      // (already used for chess.js) and confirmed via direct fetch to serve the correct
+      // application/javascript content-type — no proxy needed for this file.
+      const workerBaseUrl = "https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js";
 
       // Browsers block `new Worker(crossOriginUrl)` directly (same-origin policy on Worker
       // construction). The standard workaround: create the worker from a same-origin Blob
@@ -363,12 +345,7 @@ function getStockfishWorker() {
       //
       // The bootstrap also installs its own error/unhandledrejection listeners INSIDE the
       // worker's global scope, reporting failures back via a distinctively-prefixed
-      // postMessage. This matters because Stockfish's own internal wasm-loading promise
-      // chain ends in `.catch(e => setTimeout(() => { throw e }, 1))` — a deferred re-throw
-      // that doesn't always surface reliably through the main thread's worker.onerror
-      // listener across all browsers/versions. If the wasm fetch is failing or rejecting
-      // inside the worker, this should now catch and report it explicitly instead of the
-      // silence observed in testing.
+      // postMessage, in case anything fails silently the way it did with the WASM build.
       const bootstrap = `
         self.addEventListener('error', function(e) {
           postMessage('__BOOTSTRAP_ERROR__ ' + (e.message || e) + ' at ' + (e.filename || '?') + ':' + (e.lineno || '?'));
@@ -384,7 +361,7 @@ function getStockfishWorker() {
         }
       `;
       const blob = new Blob([bootstrap], { type: "application/javascript" });
-      const blobUrl = URL.createObjectURL(blob) + wasmHash;
+      const blobUrl = URL.createObjectURL(blob);
       const worker = new Worker(blobUrl);
       let uciokSeen = false;
       let readyokSeen = false;
@@ -396,16 +373,11 @@ function getStockfishWorker() {
 
       // Proper UCI handshake has two stages, not one:
       //   1. "uci" -> engine identifies itself, ends with "uciok"
-      //   2. "isready" -> engine confirms it has finished initializing (WASM compiled,
-      //      tables built, etc.) and is truly ready to receive position/go commands,
-      //      ending with "readyok"
-      // A previous version of this code only waited for "uciok" and then immediately
-      // started sending real analysis commands. On mobile, compiling a 7.3MB WASM binary
-      // is a genuinely slow, variable-duration step that can still be in progress after
-      // "uciok" — commands sent too early get silently queued by the engine's own JS
-      // wrapper and processed later in a burst, which produced the suspiciously uniform
-      // "everything landed in one bucket" results seen in testing. Waiting for "readyok"
-      // is the standard, correct way UCI-compliant GUIs confirm an engine can actually work.
+      //   2. "isready" -> engine confirms it has finished initializing and is truly ready
+      //      to receive position/go commands, ending with "readyok"
+      // Even for the smaller asm.js build, waiting for "readyok" (not just "uciok") is the
+      // standard, correct way UCI-compliant GUIs confirm an engine can actually work —
+      // "uciok" only confirms the identification handshake finished, not full readiness.
       const onMessage = (e) => {
         const text = String(e.data);
         // Log every message during handshake — including the __BOOTSTRAP_*__ diagnostic
