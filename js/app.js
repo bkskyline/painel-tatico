@@ -296,7 +296,23 @@ async function fetchLichessAnalysis(gameId, pgn, side) {
     // Reuse the exact same glyph classifier already used for Chessis-style PGNs — this
     // guarantees byte-for-byte the same bucket vocabulary and logic across both paths.
     const counts = classifyMoves(mine);
-    const moveResults = mine.map((san) => ({ san, cpLoss: null, bucket: glyphBucket(san) }));
+
+    // Cross-reference against buildPlyList (built from the original, non-annotated PGN) to
+    // attach board-position data (destination square, true move number) to each of the
+    // user's moves — needed for the board heatmap and accurate phase tagging. The literate
+    // PGN's user-side move count should exactly match buildPlyList's user-side ply count
+    // since both are parsing the same underlying game; if that number happens to not line
+    // up (e.g. import parsing edge cases), we degrade gracefully to entries with the glyph
+    // classification but no board-position metadata rather than failing the whole import.
+    const allPlies = buildPlyList(pgn);
+    const myPlies = allPlies ? allPlies.filter((p) => !side || p.side === side) : null;
+    const moveResults = mine.map((san, i) => {
+      const ply = myPlies && myPlies[i];
+      return {
+        san, cpLoss: null, bucket: glyphBucket(san),
+        to: ply ? ply.to : null, moveNumber: ply ? ply.moveNumber : null, plyIndex: ply ? ply.plyIndex : null,
+      };
+    });
 
     console.log("Lichess: final counts (from Lichess's own glyphs)", counts);
     return { ok: true, counts, moveResults };
@@ -483,11 +499,17 @@ function buildPlyList(rawPgn) {
 
   const replay = new Chess();
   const plies = [];
-  history.forEach((mv) => {
+  history.forEach((mv, idx) => {
     const fenBefore = replay.fen();
     replay.move({ from: mv.from, to: mv.to, promotion: mv.promotion });
     const fenAfter = replay.fen();
-    plies.push({ san: mv.san, fenBefore, fenAfter, side: mv.color === "w" ? "white" : "black" });
+    // moveNumber: standard chess move numbering (1 for both White's and Black's 1st move,
+    // 2 for both sides' 2nd, etc.) — computed from the ply index, not from PGN text parsing.
+    const moveNumber = Math.floor(idx / 2) + 1;
+    plies.push({
+      san: mv.san, fenBefore, fenAfter, side: mv.color === "w" ? "white" : "black",
+      from: mv.from, to: mv.to, moveNumber, plyIndex: idx,
+    });
   });
   return plies;
 }
@@ -551,7 +573,10 @@ async function analyzeWithStockfish(rawPgn, side, onProgress) {
     const after = -evalAfter * sign; // after the move, eval is reported from other side's turn
     const cpLoss = before - after;
     const evalBeforeAbs = Math.abs(before);
-    results.push({ san: ply.san, cpLoss, bucket: bucketFromCpLoss(cpLoss, evalBeforeAbs) });
+    results.push({
+      san: ply.san, cpLoss, bucket: bucketFromCpLoss(cpLoss, evalBeforeAbs),
+      to: ply.to, moveNumber: ply.moveNumber, plyIndex: ply.plyIndex,
+    });
     onProgress && onProgress(i + 1, plies.length);
   }
 
@@ -602,15 +627,83 @@ function computeGameKPIs(game, resolvedSide, externalCounts, externalMoveResults
   }
 
   weakestPhase = Object.entries(phaseErr).sort((a, b) => b[1] - a[1])[0]?.[0] || "middlegame";
-  return { counts, errorRate, phaseErr, weakestPhase, totalMoves: total };
+  const hasEngineData = !!(externalMoveResults && externalMoveResults.length > 0);
+  return { counts, errorRate, phaseErr, weakestPhase, totalMoves: total, moveResults: externalMoveResults || null, hasEngineData };
 }
 
-function aggregateKPIs(games) {
+// Builds a per-square heatmap of error weight (inaccuracy=1, mistake=2, blunder=3) across
+// all supplied games' moveResults. Only meaningful for engine-analysed games, since only
+// those carry the `to` (destination square) field per move.
+function buildSquareHeatmap(games) {
+  const squares = {};
+  games.forEach((g) => {
+    const results = g.kpis.moveResults;
+    if (!results) return;
+    results.forEach((r) => {
+      if (!r.to) return;
+      const weight = r.bucket === "blunder" ? 3 : r.bucket === "mistake" ? 2 : r.bucket === "inaccuracy" ? 1 : 0;
+      if (weight === 0) return;
+      squares[r.to] = (squares[r.to] || 0) + weight;
+    });
+  });
+  return squares;
+}
+
+// Computes a true per-game error-rate trend line (one point per game, in chronological
+// order) rather than a crude first-half-vs-second-half split — enough resolution to plot
+// an actual line chart and spot real trajectory, streaks, or volatility.
+function buildTrendSeries(games) {
+  const sorted = [...games].sort((a, b) => new Date(a.addedAt) - new Date(b.addedAt));
+  return sorted.map((g, i) => ({
+    index: i + 1,
+    date: g.addedAt,
+    errorRate: g.kpis.errorRate,
+    opponent: g.parsed.tags.White && /voc[eê]/i.test(g.parsed.tags.White) ? g.parsed.tags.Black : g.parsed.tags.White,
+  }));
+}
+
+// Detects recurring error patterns by grouping every error (inaccuracy/mistake/blunder)
+// across all games by contextual tags — phase and "under-10-moves-of-book" vs
+// "past move 15" — and returns the tags ranked by how often errors happen there. This is
+// what actually answers "where do I keep messing up," rather than a single static
+// "weakest phase" label with no supporting detail.
+function detectErrorPatterns(games) {
+  const tagCounts = {};
+  let totalErrors = 0;
+  games.forEach((g) => {
+    const results = g.kpis.moveResults;
+    if (!results) return;
+    results.forEach((r) => {
+      const isError = r.bucket === "blunder" || r.bucket === "mistake" || r.bucket === "inaccuracy";
+      if (!isError) return;
+      totalErrors++;
+      const tags = [];
+      if (r.moveNumber != null) {
+        if (r.moveNumber <= 10) tags.push("Nos 10 primeiros lances");
+        else if (r.moveNumber <= 25) tags.push("Meio-jogo (lances 11–25)");
+        else tags.push("Final (lance 26+)");
+      }
+      if (r.bucket === "blunder") tags.push("Erros graves especificamente");
+      tags.forEach((t) => { tagCounts[t] = (tagCounts[t] || 0) + 1; });
+    });
+  });
+  const patterns = Object.entries(tagCounts)
+    .map(([tag, count]) => ({ tag, count, pct: totalErrors > 0 ? count / totalErrors : 0 }))
+    .sort((a, b) => b.count - a.count);
+  return { patterns, totalErrors };
+}
+
+function aggregateKPIs(games, options) {
   if (games.length === 0) return null;
+  const engineOnly = options && options.engineOnly;
+  const usableGames = engineOnly ? games.filter((g) => g.kpis.hasEngineData) : games;
+  const excludedCount = games.length - usableGames.length;
+  if (usableGames.length === 0) return { empty: true, excludedCount, totalGames: games.length };
+
   const byOpening = {};
   let wins = 0, losses = 0, draws = 0, totalErrorRate = 0;
   const phaseAgg = { opening: [], middlegame: [], endgame: [] };
-  games.forEach((g) => {
+  usableGames.forEach((g) => {
     const fam = openingFamily(g.parsed.tags.Opening || g.parsed.tags.ECO);
     const result = detectResult(g.parsed.tags, g.resolvedSide);
     if (!byOpening[fam]) byOpening[fam] = { games: 0, wins: 0, losses: 0, draws: 0, errorRateSum: 0 };
@@ -627,32 +720,42 @@ function aggregateKPIs(games) {
   const openingStats = Object.entries(byOpening).map(([name, s]) => ({
     name, games: s.games, winRate: s.wins / s.games, lossRate: s.losses / s.games, avgErrorRate: s.errorRateSum / s.games,
   })).sort((a, b) => b.games - a.games);
+
   return {
-    totalGames: games.length, wins, losses, draws, winPct: wins / games.length,
-    avgErrorRate: totalErrorRate / games.length, avgPhaseErr,
+    totalGames: usableGames.length, excludedCount, wins, losses, draws, winPct: wins / usableGames.length,
+    avgErrorRate: totalErrorRate / usableGames.length, avgPhaseErr,
     weakestPhaseOverall: Object.entries(avgPhaseErr).sort((a, b) => b[1] - a[1])[0][0],
     openingStats,
+    heatmap: buildSquareHeatmap(usableGames),
+    trend: buildTrendSeries(usableGames),
+    patterns: detectErrorPatterns(usableGames),
   };
 }
 
 function generateTips(agg, games) {
-  if (!agg || games.length === 0) return [];
+  if (!agg || agg.empty || games.length === 0) return [];
   const tips = [];
-  const phaseNames = { opening: "abertura", middlegame: "meio-jogo", endgame: "final" };
-  const wp = agg.weakestPhaseOverall;
-  tips.push({
-    title: `Foco de treino: ${phaseNames[wp]}`,
-    body: `Sua taxa de erro ponderada é mais alta no ${phaseNames[wp]} (${(agg.avgPhaseErr[wp] * 100).toFixed(1)}%) comparado às outras fases. Isso indica onde seus pontos perdidos se concentram.`,
-    action: wp === "opening" ? "Prática recomendada: puzzles de abertura com tempo curto — 15 min/dia."
-      : wp === "middlegame" ? "Prática recomendada: puzzles táticos temáticos (garfos, cravadas, ataques duplos)."
-      : "Prática recomendada: finais de peão e torre básicos.",
-  });
+
+  // Tip 1: the strongest detected error pattern, with real supporting counts — not a
+  // static "weakest phase" label, but the actual most common context where errors happen.
+  const topPattern = agg.patterns.patterns[0];
+  if (topPattern && agg.patterns.totalErrors > 0) {
+    tips.push({
+      title: `Padrão detectado: ${topPattern.tag}`,
+      body: `${topPattern.count} de ${agg.patterns.totalErrors} erros (${(topPattern.pct * 100).toFixed(0)}%) analisados por engine aconteceram nesse contexto — é o padrão mais consistente nos seus dados, não uma média solta.`,
+      action: topPattern.tag.includes("10 primeiros") ? "Sugestão: revise sua preparação de abertura nas linhas que mais joga — o erro está saindo do livro, não na execução tática."
+        : topPattern.tag.includes("Final") ? "Sugestão: pratique finais básicos (peão e torre) — é onde a concentração mais costuma cair."
+        : topPattern.tag.includes("grave") ? "Sugestão: use mais tempo antes de lances que parecem óbvios — erro grave geralmente vem de pressa, não de falta de conhecimento."
+        : "Sugestão: pratique puzzles táticos temáticos (garfos, cravadas, ataques duplos) focados nesse trecho do jogo.",
+    });
+  }
+
   const viable = agg.openingStats.filter((o) => o.games >= 2);
   const best = viable.sort((a, b) => b.winRate - a.winRate)[0];
   if (best) {
     tips.push({
       title: `Sua melhor abertura: ${best.name}`,
-      body: `Em ${best.games} partida(s), você tem ${(best.winRate * 100).toFixed(0)}% de vitórias e erro médio de ${(best.avgErrorRate * 100).toFixed(1)}%.`,
+      body: `Em ${best.games} partida(s) analisadas por engine, você tem ${(best.winRate * 100).toFixed(0)}% de vitórias e erro médio de ${(best.avgErrorRate * 100).toFixed(1)}%.`,
       action: "Sugestão: aprofunde essa linha em vez de diversificar repertório agora.",
     });
   }
@@ -664,39 +767,45 @@ function generateTips(agg, games) {
       action: "Sugestão: estude a fundo ou evite temporariamente até fechar o gap de erro.",
     });
   }
+
   const totalBlunders = games.reduce((sum, g) => sum + g.kpis.counts.blunder, 0);
   const totalGenius = games.reduce((sum, g) => sum + g.kpis.counts.genius, 0);
   if (totalBlunders > 0) {
     tips.push({
       title: `Controle de erro grave`,
-      body: `${totalBlunders} erro(s) grave(s) (??) contra ${totalGenius} lance(s) geniais (!!) — capacidade tática alta, mas inconsistente.`,
+      body: `${totalBlunders} erro(s) grave(s) contra ${totalGenius} lance(s) geniais — capacidade tática alta, mas inconsistente.`,
       action: "Sugestão: antes de cada lance não-forçado, pergunte 'o que meu oponente ameaça se eu não fizer nada'.",
     });
   } else {
     tips.push({
       title: `Consistência tática`,
-      body: `Nenhum erro grave registrado — sinal forte de disciplina tática.`,
+      body: `Nenhum erro grave registrado nas partidas analisadas por engine — sinal forte de disciplina tática.`,
       action: "Sugestão: suba o nível dos oponentes para achar seu teto real.",
     });
   }
-  if (games.length >= 3) {
-    const sorted = [...games].sort((a, b) => new Date(a.addedAt) - new Date(b.addedAt));
-    const half = Math.floor(sorted.length / 2);
-    const firstHalfErr = sorted.slice(0, half).reduce((s, g) => s + g.kpis.errorRate, 0) / (half || 1);
-    const secondHalfErr = sorted.slice(half).reduce((s, g) => s + g.kpis.errorRate, 0) / (sorted.length - half || 1);
-    const improving = secondHalfErr < firstHalfErr;
+
+  // Tip: real per-game trend, using the same series that feeds the trend chart, comparing
+  // first-third vs last-third instead of a crude half split for more signal on more games.
+  if (agg.trend.length >= 3) {
+    const n = agg.trend.length;
+    const third = Math.max(1, Math.floor(n / 3));
+    const early = agg.trend.slice(0, third);
+    const recent = agg.trend.slice(-third);
+    const earlyAvg = early.reduce((s, p) => s + p.errorRate, 0) / early.length;
+    const recentAvg = recent.reduce((s, p) => s + p.errorRate, 0) / recent.length;
+    const improving = recentAvg < earlyAvg;
     tips.push({
       title: improving ? "Tendência de melhora confirmada" : "Tendência de erro subindo",
       body: improving
-        ? `Erro caiu de ${(firstHalfErr * 100).toFixed(1)}% para ${(secondHalfErr * 100).toFixed(1)}%.`
-        : `Erro subiu de ${(firstHalfErr * 100).toFixed(1)}% para ${(secondHalfErr * 100).toFixed(1)}%.`,
-      action: improving ? "Sugestão: suba a dificuldade do oponente gradualmente." : "Sugestão: reduza volume por sessão por 1-2 semanas.",
+        ? `Erro médio caiu de ${(earlyAvg * 100).toFixed(1)}% (primeiras partidas) para ${(recentAvg * 100).toFixed(1)}% (mais recentes), com base em ${n} partidas analisadas por engine.`
+        : `Erro médio subiu de ${(earlyAvg * 100).toFixed(1)}% (primeiras partidas) para ${(recentAvg * 100).toFixed(1)}% (mais recentes), com base em ${n} partidas analisadas por engine.`,
+      action: improving ? "Sugestão: suba a dificuldade do oponente gradualmente." : "Sugestão: reduza volume por sessão por 1-2 semanas e foque em qualidade.",
     });
   } else {
     tips.push({
       title: "Volume de dados ainda baixo",
-      body: `Com ${games.length} partida(s), tendências ainda não são confiáveis.`,
-      action: "Sugestão: adicione pelo menos 5-10 partidas.",
+      body: `Com ${agg.trend.length} partida(s) analisadas por engine, tendências ainda não são confiáveis.`,
+      action: "Sugestão: adicione pelo menos 5-10 partidas com Stockfish.js ou Lichess para destravar essa análise.",
     });
   }
   return tips.slice(0, 5);
@@ -723,6 +832,126 @@ function Bar({ pct, tone }) {
   );
 }
 
+// SVG chessboard heatmap: darker/redder squares = more error weight accumulated there
+// across all analysed games. Board drawn from White's perspective (a1 bottom-left).
+function BoardHeatmap({ heatmap }) {
+  const files = ["a", "b", "c", "d", "e", "f", "g", "h"];
+  const ranks = [8, 7, 6, 5, 4, 3, 2, 1];
+  const maxWeight = Math.max(1, ...Object.values(heatmap));
+  const cell = 40;
+  const boardSize = cell * 8;
+
+  const squareEls = [];
+  ranks.forEach((rank, rIdx) => {
+    files.forEach((file, fIdx) => {
+      const square = `${file}${rank}`;
+      const isLight = (rIdx + fIdx) % 2 === 0;
+      const weight = heatmap[square] || 0;
+      const intensity = weight / maxWeight;
+      const baseColor = isLight ? "#2a2818" : "#1d1c14";
+      // Blend toward rust/red proportional to error intensity on this square.
+      const errorColor = intensity > 0
+        ? `rgba(217, 112, 82, ${0.15 + intensity * 0.75})`
+        : null;
+      squareEls.push(
+        React.createElement("rect", {
+          key: square, x: fIdx * cell, y: rIdx * cell, width: cell, height: cell,
+          fill: baseColor,
+        })
+      );
+      if (errorColor) {
+        squareEls.push(
+          React.createElement("rect", {
+            key: square + "-heat", x: fIdx * cell, y: rIdx * cell, width: cell, height: cell,
+            fill: errorColor,
+          })
+        );
+      }
+      if (weight > 0) {
+        squareEls.push(
+          React.createElement("text", {
+            key: square + "-label", x: fIdx * cell + cell / 2, y: rIdx * cell + cell / 2 + 4,
+            textAnchor: "middle", fontSize: 11, fontWeight: 700,
+            fill: intensity > 0.4 ? "#1a1712" : C.inkDim,
+          }, weight)
+        );
+      }
+    });
+  });
+
+  const hasAnyData = Object.keys(heatmap).length > 0;
+
+  return React.createElement("div", { style: { display: "flex", flexDirection: "column", alignItems: "center", gap: 10 } },
+    hasAnyData
+      ? React.createElement("svg", { viewBox: `0 0 ${boardSize} ${boardSize}`, width: "100%", style: { maxWidth: 360, borderRadius: 6, border: `1px solid ${C.line}` } }, squareEls)
+      : React.createElement("p", { style: { color: C.inkFaint, fontSize: 13, padding: "30px 0" } }, "Sem dados de casas ainda — precisa de partidas analisadas por engine."),
+    hasAnyData && React.createElement("p", { style: { color: C.inkFaint, fontSize: 12, textAlign: "center" } },
+      "Número = peso de erro acumulado na casa (imprecisão=1, erro=2, erro grave=3). Mais vermelho = mais erro."
+    )
+  );
+}
+
+// SVG line chart of per-game error rate over time, so the trend is something you actually
+// see at a glance instead of reading two percentages in a sentence.
+function TrendChart({ trend }) {
+  if (!trend || trend.length < 2) {
+    return React.createElement("p", { style: { color: C.inkFaint, fontSize: 13, padding: "20px 0", textAlign: "center" } },
+      "Precisa de pelo menos 2 partidas analisadas por engine para plotar tendência."
+    );
+  }
+  const w = 600, h = 180, padX = 16, padY = 20;
+  const maxErr = Math.max(0.05, ...trend.map((p) => p.errorRate));
+  const stepX = (w - padX * 2) / (trend.length - 1);
+  const points = trend.map((p, i) => {
+    const x = padX + i * stepX;
+    const y = h - padY - (p.errorRate / maxErr) * (h - padY * 2);
+    return { x, y, ...p };
+  });
+  const pathD = points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" ");
+  const areaD = `${pathD} L ${points[points.length - 1].x.toFixed(1)} ${h - padY} L ${points[0].x.toFixed(1)} ${h - padY} Z`;
+
+  return React.createElement("svg", { viewBox: `0 0 ${w} ${h}`, width: "100%", style: { display: "block" } },
+    React.createElement("defs", null,
+      React.createElement("linearGradient", { id: "trendFade", x1: "0", y1: "0", x2: "0", y2: "1" },
+        React.createElement("stop", { offset: "0%", stopColor: C.brass, stopOpacity: 0.35 }),
+        React.createElement("stop", { offset: "100%", stopColor: C.brass, stopOpacity: 0 })
+      )
+    ),
+    // Horizontal gridline at the average
+    React.createElement("line", {
+      x1: padX, x2: w - padX,
+      y1: h - padY - (trend.reduce((s, p) => s + p.errorRate, 0) / trend.length / maxErr) * (h - padY * 2),
+      y2: h - padY - (trend.reduce((s, p) => s + p.errorRate, 0) / trend.length / maxErr) * (h - padY * 2),
+      stroke: C.line, strokeWidth: 1, strokeDasharray: "4 4",
+    }),
+    React.createElement("path", { d: areaD, fill: "url(#trendFade)" }),
+    React.createElement("path", { d: pathD, fill: "none", stroke: C.brass, strokeWidth: 2.5, strokeLinejoin: "round", strokeLinecap: "round" }),
+    points.map((p, i) => React.createElement("circle", {
+      key: i, cx: p.x, cy: p.y, r: 4, fill: C.bg, stroke: C.brass, strokeWidth: 2,
+    })),
+    points.map((p, i) => (i === 0 || i === points.length - 1) && React.createElement("text", {
+      key: "label" + i, x: p.x, y: h - 4, fontSize: 10, fill: C.inkFaint,
+      textAnchor: i === 0 ? "start" : "end",
+    }, `${(p.errorRate * 100).toFixed(0)}%`))
+  );
+}
+
+function PatternCard({ pattern, rank }) {
+  return React.createElement("div", {
+    style: { display: "flex", alignItems: "center", gap: 14, background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, padding: "14px 18px" }
+  },
+    React.createElement("span", {
+      style: { fontFamily: "Georgia, serif", fontSize: 20, color: rank === 0 ? C.rustBright : C.brass, minWidth: 28, textAlign: "center" }
+    }, `#${rank + 1}`),
+    React.createElement("div", { style: { flex: 1 } },
+      React.createElement("p", { style: { fontWeight: 700, fontSize: 14, margin: "0 0 2px" } }, pattern.tag),
+      React.createElement("p", { style: { color: C.inkFaint, fontSize: 12.5, margin: 0 } }, `${pattern.count} ocorrências`)
+    ),
+    React.createElement("div", { style: { width: 80 } }, React.createElement(Bar, { pct: pattern.pct * 3, tone: rank === 0 ? "bad" : "neutral" })),
+    React.createElement("span", { style: { fontSize: 13, fontWeight: 700, color: C.inkDim, minWidth: 40, textAlign: "right" } }, `${(pattern.pct * 100).toFixed(0)}%`)
+  );
+}
+
 function SectionLabel({ children }) {
   return React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 14 } },
     React.createElement("span", { style: { width: 8, height: 8, background: C.brass, borderRadius: 1, transform: "rotate(45deg)" } }),
@@ -744,7 +973,15 @@ function GameRow({ game, onClick }) {
   );
 }
 
-function DashboardView({ games, agg, agg20, last20, tips, onGoAdd, onGoHistory, onSelectGame }) {
+function DashboardView({ games, onGoAdd, onGoHistory, onSelectGame }) {
+  const [engineOnly, setEngineOnly] = useState(true);
+  const engineGameCount = games.filter((g) => g.kpis.hasEngineData).length;
+
+  const last20 = useMemo(() => games.slice(-20), [games]);
+  const agg = useMemo(() => aggregateKPIs(games, { engineOnly }), [games, engineOnly]);
+  const agg20 = useMemo(() => aggregateKPIs(last20, { engineOnly }), [last20, engineOnly]);
+  const tips = useMemo(() => generateTips(agg20 && !agg20.empty ? agg20 : agg, (agg20 && !agg20.empty ? last20 : games).filter((g) => !engineOnly || g.kpis.hasEngineData)), [agg20, agg, last20, games, engineOnly]);
+
   if (games.length === 0) {
     return React.createElement("div", { style: { textAlign: "center", padding: "60px 20px", border: `1px dashed ${C.line}`, borderRadius: 10 } },
       React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 20, marginBottom: 8 } }, "Nenhuma partida ainda"),
@@ -752,35 +989,67 @@ function DashboardView({ games, agg, agg20, last20, tips, onGoAdd, onGoHistory, 
       React.createElement("button", { onClick: onGoAdd, style: { background: C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "10px 20px", fontWeight: 700, cursor: "pointer" } }, "Adicionar partida")
     );
   }
+
+  const EngineToggle = () => React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, background: C.bgPanel2, border: `1px solid ${C.line}`, borderRadius: 8, padding: "8px 14px" } },
+    React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 13, color: C.inkDim } },
+      React.createElement("input", { type: "checkbox", checked: engineOnly, onChange: (e) => setEngineOnly(e.target.checked) }),
+      `Só partidas com engine real (${engineGameCount}/${games.length})`
+    )
+  );
+
+  if (!agg || agg.empty) {
+    return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 20 } },
+      React.createElement("div", { style: { display: "flex", justifyContent: "flex-end" } }, React.createElement(EngineToggle)),
+      React.createElement("div", { style: { textAlign: "center", padding: "50px 20px", border: `1px dashed ${C.line}`, borderRadius: 10 } },
+        React.createElement("p", { style: { fontFamily: "Georgia, serif", fontSize: 18, marginBottom: 8 } }, "Nenhuma partida analisada por engine ainda"),
+        React.createElement("p", { style: { color: C.inkDim, fontSize: 13.5, marginBottom: 16 } }, "Os KPIs detalhados (padrões, tendência, mapa de erro) só valem para partidas com Stockfish.js ou Lichess — dados de anotação de PGN sozinhos não têm precisão suficiente."),
+        React.createElement("button", { onClick: onGoAdd, style: { background: C.brass, color: C.bg, border: "none", borderRadius: 6, padding: "10px 20px", fontWeight: 700, cursor: "pointer" } }, "Adicionar partida com engine")
+      )
+    );
+  }
+
   const phaseLabels = { opening: "Abertura", middlegame: "Meio-jogo", endgame: "Final" };
-  return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 32 } },
-    React.createElement("div", null,
-      React.createElement(SectionLabel, null, `Últimas ${last20.length} partidas`),
-      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 16, background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 20 } },
-        React.createElement(Stat, { label: "Taxa de vitória", value: `${(agg20.winPct * 100).toFixed(0)}%`, accent: C.feltBright }),
-        React.createElement(Stat, { label: "V / E / D", value: `${agg20.wins}/${agg20.draws}/${agg20.losses}` }),
-        React.createElement(Stat, { label: "Erro médio ponderado", value: `${(agg20.avgErrorRate * 100).toFixed(1)}%`, accent: agg20.avgErrorRate > 0.15 ? C.rustBright : C.feltBright }),
-        React.createElement(Stat, { label: "Fase mais fraca", value: phaseLabels[agg20.weakestPhaseOverall], accent: C.brass })
+
+  return React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 36 } },
+    React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 } },
+      React.createElement(SectionLabel, null, `Visão geral (${agg.totalGames} partida${agg.totalGames !== 1 ? "s" : ""} analisadas por engine)`),
+      React.createElement(EngineToggle)
+    ),
+
+    // Headline stats — bigger, stronger visual hierarchy than a flat grid of equal-weight cards.
+    React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 18, background: C.bgPanel, border: `1px solid ${C.brassDim}`, borderRadius: 12, padding: 24 } },
+      React.createElement(Stat, { label: "Taxa de vitória", value: `${(agg.winPct * 100).toFixed(0)}%`, accent: C.feltBright }),
+      React.createElement(Stat, { label: "V / E / D", value: `${agg.wins}/${agg.draws}/${agg.losses}` }),
+      React.createElement(Stat, { label: "Erro médio ponderado", value: `${(agg.avgErrorRate * 100).toFixed(1)}%`, accent: agg.avgErrorRate > 0.15 ? C.rustBright : C.feltBright }),
+      React.createElement(Stat, { label: "Erros catalogados", value: agg.patterns.totalErrors, accent: C.brass })
+    ),
+
+    // Detected patterns — the actual "where do I keep messing up" answer, ranked by real count.
+    agg.patterns.patterns.length > 0 && React.createElement("div", null,
+      React.createElement(SectionLabel, null, "Padrões de erro detectados"),
+      React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
+        agg.patterns.patterns.slice(0, 5).map((p, i) => React.createElement(PatternCard, { key: p.tag, pattern: p, rank: i }))
       )
     ),
+
+    // Trend chart — real line chart instead of a sentence with two percentages.
     React.createElement("div", null,
-      React.createElement(SectionLabel, null, `Erro por fase (últimas ${last20.length})`),
-      React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14, background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 20 } },
-        Object.entries(phaseLabels).map(([key, label]) => {
-          const v = agg20.avgPhaseErr[key];
-          const isWorst = key === agg20.weakestPhaseOverall;
-          return React.createElement("div", { key },
-            React.createElement("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 6 } },
-              React.createElement("span", { style: { color: isWorst ? C.rustBright : C.inkDim, fontWeight: isWorst ? 700 : 400 } }, label),
-              React.createElement("span", { style: { color: C.inkFaint, fontVariantNumeric: "tabular-nums" } }, `${(v * 100).toFixed(1)}%`)
-            ),
-            React.createElement(Bar, { pct: v * 4, tone: isWorst ? "bad" : "neutral" })
-          );
-        })
+      React.createElement(SectionLabel, null, "Tendência de erro por partida"),
+      React.createElement("div", { style: { background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 20 } },
+        React.createElement(TrendChart, { trend: agg.trend })
       )
     ),
+
+    // Board heatmap.
     React.createElement("div", null,
-      React.createElement(SectionLabel, null, "5 recomendações práticas"),
+      React.createElement(SectionLabel, null, "Onde no tabuleiro você mais erra"),
+      React.createElement("div", { style: { background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 20 } },
+        React.createElement(BoardHeatmap, { heatmap: agg.heatmap })
+      )
+    ),
+
+    React.createElement("div", null,
+      React.createElement(SectionLabel, null, "Recomendações práticas"),
       React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 12 } },
         tips.map((tip, i) => React.createElement("div", { key: i, style: { background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 18 } },
           React.createElement("div", { style: { display: "flex", gap: 12, alignItems: "flex-start" } },
@@ -794,8 +1063,9 @@ function DashboardView({ games, agg, agg20, last20, tips, onGoAdd, onGoHistory, 
         ))
       )
     ),
+
     React.createElement("div", null,
-      React.createElement(SectionLabel, null, `Desempenho por abertura (todas as ${games.length} partidas)`),
+      React.createElement(SectionLabel, null, `Desempenho por abertura`),
       React.createElement("div", { style: { background: C.bgPanel, border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden" } },
         React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", fontSize: 13 } },
           React.createElement("thead", null,
@@ -814,6 +1084,7 @@ function DashboardView({ games, agg, agg20, last20, tips, onGoAdd, onGoHistory, 
         )
       )
     ),
+
     React.createElement("div", null,
       React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 } },
         React.createElement(SectionLabel, null, "Partidas recentes"),
@@ -1320,10 +1591,6 @@ function App() {
     e.target.value = "";
   };
 
-  const agg = useMemo(() => aggregateKPIs(games), [games]);
-  const last20 = useMemo(() => games.slice(-20), [games]);
-  const agg20 = useMemo(() => aggregateKPIs(last20), [last20]);
-  const tips = useMemo(() => generateTips(agg20 || agg, last20.length ? last20 : games), [agg20, agg, last20, games]);
   const selectedGame = games.find((g) => g.id === selectedGameId);
 
   return React.createElement("div", { style: { minHeight: "100vh", background: C.bg, color: C.ink, fontFamily: "-apple-system, sans-serif", paddingBottom: 60 } },
@@ -1367,7 +1634,7 @@ function App() {
       : tab === "settings" ? React.createElement(SettingsView, { settings, onSave: persistSettings })
       : tab === "history" ? React.createElement(HistoryView, { games, onSelect: (id) => { setSelectedGameId(id); setTab("game"); }, onDelete: handleDeleteGame })
       : tab === "game" && selectedGame ? React.createElement(GameDetailView, { game: selectedGame, onBack: () => setTab("history") })
-      : React.createElement(DashboardView, { games, agg, agg20, last20, tips, onGoAdd: () => setTab("add"), onGoHistory: () => setTab("history"), onSelectGame: (id) => { setSelectedGameId(id); setTab("game"); } })
+      : React.createElement(DashboardView, { games, onGoAdd: () => setTab("add"), onGoHistory: () => setTab("history"), onSelectGame: (id) => { setSelectedGameId(id); setTab("game"); } })
     )
   );
 }
